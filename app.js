@@ -1,4 +1,4 @@
-/* myHistory v0.2.0 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory v0.2.1 — reconstruct & maintain a node's transaction history (summary).
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
    Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
@@ -6,7 +6,7 @@
 (function(){
 "use strict";
 
-var VERSION   = "0.2.0";   // fallback only — real display is read from dapp.conf at runtime
+var VERSION   = "0.2.1";   // fallback only — real display is read from dapp.conf at runtime
 var EXPLORER  = "https://block.minima.global";
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
 var PER_PAGE  = 1;       // ONE doc per request (~50KB). search.get docs are large (no CORS to
@@ -428,6 +428,55 @@ function render(){
     });
   }).catch(function(e){ MDS.log("[myHistory] render error: "+e.message); });
 }
+
+/* ---------- export (CSV / JSON) ---------- */
+function fmtBytes(n){ if(n<1024) return n+" B"; if(n<1048576) return (n/1024).toFixed(1)+" KB"; return (n/1048576).toFixed(2)+" MB"; }
+function csvCell(v){ v=String(v==null?"":v); return /[",\n\r]/.test(v)?('"'+v.replace(/"/g,'""')+'"'):v; }
+// pull every row matching the current filters, in batches, so a huge history doesn't load in one shot
+function exportRows(){
+  var where=whereClause(), ob=orderBy(), out=[], off=0, BATCH=1000;
+  function loop(){
+    return sql("SELECT txpowid,block,txtime,txdate,direction,in_amount,out_amount,net,tokenids,counterparties,source FROM txns "+where+ob+" LIMIT "+BATCH+" OFFSET "+off).then(function(rows){
+      out=out.concat(rows);
+      if(rows.length<BATCH) return out;
+      off+=BATCH; return loop();
+    });
+  }
+  return loop();
+}
+function doExport(fmt){
+  if(state.busy){ showStatus("Busy — let the current scan finish before exporting.","error"); return; }
+  if(!state.totalRows){ showStatus("No history to export yet.","error"); return; }
+  showStatus("Preparing "+fmt.toUpperCase()+" export…","");
+  exportRows().then(function(rows){
+    if(!rows.length){ showStatus("Nothing matches the current filters.","error"); return; }
+    var cols=[["date","TXDATE"],["block","BLOCK"],["time_ms","TXTIME"],["direction","DIRECTION"],
+              ["net","NET"],["in_amount","IN_AMOUNT"],["out_amount","OUT_AMOUNT"],
+              ["tokens","TOKENIDS"],["counterparties","COUNTERPARTIES"],["txid","TXPOWID"],["source","SOURCE"]];
+    var text, ext, mime;
+    if(fmt==="csv"){
+      var lines=[cols.map(function(c){return c[0];}).join(",")];
+      rows.forEach(function(r){ lines.push(cols.map(function(c){ return csvCell(r[c[1]]); }).join(",")); });
+      text=lines.join("\r\n"); ext="csv"; mime="text/csv";
+    } else {
+      var arr=rows.map(function(r){ return {
+        date:r.TXDATE, block:N(r.BLOCK), time_ms:N(r.TXTIME), direction:r.DIRECTION, net:r.NET,
+        in_amount:r.IN_AMOUNT, out_amount:r.OUT_AMOUNT,
+        tokens:String(r.TOKENIDS||"").split(",").filter(Boolean),
+        counterparties:String(r.COUNTERPARTIES||"").split(",").filter(Boolean),
+        txid:r.TXPOWID, source:r.SOURCE }; });
+      text=JSON.stringify({ generated:new Date().toISOString(), source:EXPLORER, count:arr.length, transactions:arr }, null, 2);
+      ext="json"; mime="application/json";
+    }
+    var name="myhistory_"+new Date().toISOString().replace(/[:.]/g,"-").slice(0,19)+"."+ext;
+    try{
+      var blob=new Blob([text],{type:mime}), url=URL.createObjectURL(blob), a=document.createElement("a");
+      a.href=url; a.download=name; document.body.appendChild(a); a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); },1500);
+      showStatus("Exported "+rows.length.toLocaleString()+" rows → "+name+" ("+fmtBytes(text.length)+"). If no download appeared, your node's browser may block it.","ok");
+    }catch(e){ showStatus("Export failed: "+e.message,"error"); }
+  }).catch(function(e){ showStatus("Export error: "+e.message,"error"); });
+}
 function openDetailRow(tr,r){
   // idempotent: never inserts a second detail row for the same tx
   var nxt=tr.nextElementSibling;
@@ -515,6 +564,8 @@ function init(){
   document.getElementById("backfillBtn").onclick=function(){ backfillArchive(); };
   document.getElementById("resyncBtn").onclick=function(){ incremental(); };
   document.getElementById("stopBtn").onclick=function(){ state.cancel=true; logp("Stopping…"); };
+  document.getElementById("exportCsvBtn").onclick=function(){ doExport("csv"); };
+  document.getElementById("exportJsonBtn").onclick=function(){ doExport("json"); };
   var qTimer=null;
   document.getElementById("q").addEventListener("input",function(){
     var v=this.value.trim().toLowerCase();   // debounce: search scans the whole table, so wait for a typing pause

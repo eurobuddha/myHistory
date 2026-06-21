@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<meta http-equiv="Cache-Control" content="no-store"/>
+<meta http-equiv="Pragma" content="no-cache"/>
+<title>myHistory</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1b222c; --line:#283040;
+    --text:#e6edf3; --dim:#8b97a7; --accent:#7c5cff; --cyan:#22d3ee;
+    --in:#3fb950; --out:#f0883e; --self:#8b97a7; --err:#f85149;
+    --fs: clamp(13px, 0.7vw + 11px, 16px);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--text);font:var(--fs)/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       padding-bottom:env(safe-area-inset-bottom)}
+  a{color:var(--cyan);word-break:break-all}
+  header{padding:14px clamp(12px,3vw,28px);border-bottom:1px solid var(--line);background:var(--panel);
+         display:flex;align-items:center;gap:10px 18px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+  header h1{font-size:clamp(16px,1.4vw+12px,22px);margin:0;font-weight:700;letter-spacing:.2px;white-space:nowrap}
+  header h1 .v{color:var(--dim);font-weight:400;font-size:.6em;margin-left:6px}
+  .stats{display:flex;gap:8px 18px;flex-wrap:wrap;margin-left:auto}
+  .stat{font-size:.85em;color:var(--dim);white-space:nowrap}
+  .stat b{color:var(--text);font-weight:600}
+  .wrap{padding:clamp(12px,2.5vw,24px);width:100%;max-width:min(1600px,96vw);margin:0 auto}
+  button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 16px;font-size:.92em;font-weight:600;cursor:pointer;min-height:40px}
+  button.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+  button.danger{background:var(--panel2);color:#ffb4ad;border:1px solid var(--err)}
+  button:disabled{opacity:.5;cursor:default}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;margin-right:7px;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:clamp(14px,2vw,22px);margin-bottom:16px}
+  .cta h2{margin:0 0 6px;font-size:1.15em}
+  .cta p{margin:0 0 14px;color:var(--dim)}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .hidden{display:none!important}
+  .progress{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden;margin:14px 0 6px}
+  .progress > i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--cyan));width:0%;transition:width .2s}
+  .plog{font-size:.82em;color:var(--dim);white-space:pre-wrap;max-height:140px;overflow:auto;margin-top:6px;font-family:ui-monospace,Menlo,monospace}
+  .status{margin:10px 0 0;padding:0;font-size:.9em}
+  .status.show{padding:10px 12px;border-radius:8px}
+  .status.error{background:rgba(248,81,73,.12);border:1px solid var(--err);color:#ffb4ad}
+  .status.ok{background:rgba(63,185,80,.12);border:1px solid var(--in);color:#9ae6a4}
+  .legend{font-size:.78em;color:var(--dim);margin-top:12px;line-height:1.7}
+  code{background:var(--panel2);padding:1px 6px;border-radius:5px;font-size:.92em}
+
+  /* filters */
+  .filters{display:flex;gap:12px 20px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+  .fgroup{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  .fgroup > .lbl{color:var(--dim);font-size:.8em;font-weight:600;margin-right:2px}
+  .chk{display:inline-flex;gap:6px;align-items:center;cursor:pointer;user-select:none;white-space:nowrap}
+  .chk input{width:18px;height:18px;accent-color:var(--accent);cursor:pointer}
+  input[type=text],select{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:10px 12px;font-size:.92em;min-height:40px}
+  input#q{flex:1 1 220px;min-width:0}
+  select#fTok{min-height:40px}
+
+  /* table */
+  .tablewrap{width:100%;overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:.92em}
+  th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:.85em;cursor:pointer;user-select:none;white-space:nowrap;position:sticky;top:0;background:var(--panel)}
+  tr.tx{cursor:pointer}
+  tr.tx:hover{background:var(--panel2)}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:.8em;font-weight:700}
+  .pill.in{background:rgba(63,185,80,.16);color:var(--in)}
+  .pill.out{background:rgba(240,136,62,.16);color:var(--out)}
+  .pill.self{background:rgba(139,151,167,.16);color:var(--self)}
+  .src{font-size:.7em;color:var(--dim);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-left:6px;white-space:nowrap}
+  .amt{font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+  .amt.in{color:var(--in)} .amt.out{color:var(--out)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .trunc{max-width:min(40vw,320px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:bottom}
+  td.detail{background:var(--panel2);padding:clamp(12px,2vw,18px)}
+  .detail h4{margin:0 0 6px;font-size:.85em;color:var(--text);text-transform:uppercase;letter-spacing:.04em}
+  .detail .blk{margin-bottom:14px}
+  .detail pre{margin:0 0 4px;white-space:pre-wrap;word-break:break-all;font-size:.85em;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:.85em}
+  .kv .k{color:var(--dim)} .kv .val{word-break:break-all;font-family:ui-monospace,Menlo,monospace}
+  .sig{max-height:3em;overflow:hidden;cursor:pointer}
+  .sig.open{max-height:none}
+  .pager{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:16px;color:var(--dim);font-size:.9em}
+  .empty{padding:40px 10px;text-align:center;color:var(--dim)}
+
+  /* ---- narrow screens: table -> cards ---- */
+  @media (max-width:760px){
+    .stats{width:100%;margin-left:0}
+    table,thead,tbody,th,td,tr{display:block}
+    thead{position:absolute;left:-9999px}
+    tr.tx{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;padding:6px 4px;background:var(--panel)}
+    tr.tx td{border:none;padding:7px 12px;display:flex;justify-content:space-between;gap:14px;align-items:baseline}
+    tr.tx td::before{content:attr(data-label);color:var(--dim);font-size:.78em;font-weight:600;flex:0 0 auto}
+    tr.tx td .trunc{max-width:62vw;text-align:right}
+    tr.detailrow td{display:block}
+    tr.detailrow td::before{content:none}
+    .kv{grid-template-columns:1fr}
+    .kv .k{margin-top:6px}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>myHistory <span class="v" id="ver"></span></h1>
+  <div class="stats">
+    <div class="stat">txns <b id="s-count">—</b></div>
+    <div class="stat">addresses <b id="s-addr">—</b></div>
+    <div class="stat">tip <b id="s-tip">—</b></div>
+    <div class="stat">last sync <b id="s-sync">—</b></div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="card cta" id="ctaCard">
+    <h2>Reconstruct your transaction history</h2>
+    <p>Reads your node's default wallet addresses, then rebuilds their full history
+       from <code>block.minima.global</code> (≈ Sept 2024 → now). After the first run, new transactions
+       are added automatically. Older history can be backfilled from an archive node.</p>
+    <div class="row">
+      <button id="reconBtn">Reconstruct now</button>
+      <button class="ghost hidden" id="scriptsBtn">Scan contracts/scripts</button>
+      <button class="ghost" id="resyncBtn">Resync recent</button>
+      <button class="ghost" id="backfillBtn">Backfill pre-2024 (archive)</button>
+      <button class="danger hidden" id="stopBtn">Stop</button>
+    </div>
+    <div id="prog" class="hidden">
+      <div class="progress"><i id="progBar"></i></div>
+      <div class="plog" id="progLog"></div>
+    </div>
+    <div id="statusBox" class="status"></div>
+    <div class="legend"><b>Reconstruct now</b> scans your default wallet addresses first (fast). <b>Scan contracts/scripts</b> covers tracked contract &amp; newaddress scripts as a separate pass (can be large/slow). New transactions are added automatically afterward. Expanding a row shows inputs/outputs.
+      <span class="src">explorer</span> · <span class="src">archive</span> coin-level only.</div>
+  </div>
+
+  <div class="card" id="histCard">
+    <div class="filters">
+      <input type="text" id="q" placeholder="Search txid / address / amount / date…"/>
+      <div class="fgroup" id="dirGroup">
+        <span class="lbl">Show</span>
+        <label class="chk"><input type="checkbox" data-dir="in" checked> Received</label>
+        <label class="chk"><input type="checkbox" data-dir="out" checked> Sent</label>
+        <label class="chk"><input type="checkbox" data-dir="self" checked> Self</label>
+      </div>
+      <div class="fgroup" id="srcGroup">
+        <span class="lbl">Source</span>
+        <label class="chk"><input type="checkbox" data-src="explorer" checked> explorer</label>
+        <label class="chk"><input type="checkbox" data-src="archive" checked> archive</label>
+      </div>
+      <select id="fTok"><option value="">All tokens</option></select>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th data-sort="txtime">Date</th>
+          <th data-sort="direction">Dir</th>
+          <th data-sort="net">Amount</th>
+          <th data-sort="tokenids">Token</th>
+          <th>Counterparty</th>
+          <th data-sort="block">Block</th>
+          <th>TxID</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="empty hidden" id="emptyMsg">No transactions yet — run <b>Reconstruct now</b> above.</div>
+    <div class="pager" id="pager"></div>
+  </div>
+
+</div>
+
+<script type="text/javascript" src="mds.js"></script>
+<script src="app.js?v=0.2.0"></script>
+</body>
+</html>

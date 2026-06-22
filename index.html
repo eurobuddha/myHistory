@@ -81,6 +81,11 @@
   .kv .k{color:var(--dim)} .kv .val{word-break:break-all;font-family:ui-monospace,Menlo,monospace}
   .sig{max-height:3em;overflow:hidden;cursor:pointer}
   .sig.open{max-height:none}
+  .sigwarn{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:999px;font-size:.74em;font-weight:700;
+           background:rgba(248,81,73,.16);color:var(--err);border:1px solid var(--err);white-space:nowrap;vertical-align:middle}
+  tr.warn{box-shadow:inset 3px 0 0 var(--err)}
+  .sigaddr{word-break:break-all}
+  #sigCard .detail .kv .val{word-break:break-all}
   .pager{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:16px;color:var(--dim);font-size:.9em}
   .empty{padding:40px 10px;text-align:center;color:var(--dim)}
 
@@ -122,6 +127,7 @@
       <button id="reconBtn">Reconstruct now</button>
       <button class="ghost hidden" id="scriptsBtn">Scan contracts/scripts</button>
       <button class="ghost" id="resyncBtn">Resync recent</button>
+      <button class="ghost" id="sigScanBtn">Scan signatures</button>
       <button class="ghost" id="backfillBtn">Backfill pre-2024 (archive)</button>
       <button class="danger hidden" id="stopBtn">Stop</button>
     </div>
@@ -173,9 +179,35 @@
     <div class="pager" id="pager"></div>
   </div>
 
+  <div class="card" id="sigCard">
+    <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:10px">
+      <h2 style="margin:0;font-size:1.1em">Signature key usage</h2>
+      <div class="stats" style="margin-left:0">
+        <div class="stat">total uses <b id="sig-uses">—</b></div>
+        <div class="stat">distinct keys <b id="sig-keys">—</b></div>
+        <div class="stat">reused keys <b id="sig-reused">—</b></div>
+      </div>
+    </div>
+    <p style="color:var(--dim);margin:0 0 12px">How many times each signing key (rootkey · Level&nbsp;1 · Level&nbsp;3 pubkey) was used to spend from your addresses. <b>Total uses</b> counts every input; <b>reused keys</b> are keys used more than once. Run <b>Scan signatures</b> above, then expand a row to see the reused keys.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th>Address</th>
+          <th>Balance</th>
+          <th>Total uses</th>
+          <th>Distinct keys</th>
+          <th>Reused keys</th>
+          <th>Max reuse</th>
+        </tr></thead>
+        <tbody id="sigBody"></tbody>
+      </table>
+    </div>
+    <div class="empty hidden" id="sigEmpty">No signature data yet — run <b>Scan signatures</b> above.</div>
+  </div>
+
 </div>
 
 <script type="text/javascript" src="mds.js"></script>
-<script src="app.js?v=0.2.1"></script>
+<script src="app.js?v=0.2.2"></script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-/* myHistory v0.2.1 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory v0.2.2 — reconstruct & maintain a node's transaction history (summary).
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
    Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
@@ -6,7 +6,7 @@
 (function(){
 "use strict";
 
-var VERSION   = "0.2.1";   // fallback only — real display is read from dapp.conf at runtime
+var VERSION   = "0.2.2";   // fallback only — real display is read from dapp.conf at runtime
 var EXPLORER  = "https://block.minima.global";
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
 var PER_PAGE  = 1;       // ONE doc per request (~50KB). search.get docs are large (no CORS to
@@ -101,6 +101,20 @@ function createTables(){
     " PRIMARY KEY (`txpowid`) )"
   ).then(function(){ return sql("CREATE TABLE IF NOT EXISTS `myaddr` (`address` VARCHAR(160), `miniaddress` VARCHAR(160))"); })
    .then(function(){ return sql("CREATE TABLE IF NOT EXISTS `meta` (`k` VARCHAR(64) PRIMARY KEY, `v` VARCHAR(400))"); })
+   // signature-key usage per address: one row per (address, root|level1|level3) combo with a use count.
+   // total uses for an address = SUM(cnt); reused keys = rows with cnt>=2. Logic ported from MinimaTransactionMonitor.java.
+   .then(function(){ return sql(
+     "CREATE TABLE IF NOT EXISTS `sigkeys` ("+
+     " `address` VARCHAR(160) NOT NULL,"+
+     " `keyhash` VARCHAR(440) NOT NULL,"+
+     " `rootkey` VARCHAR(80),"+
+     " `level1` VARCHAR(80),"+
+     " `pubkey` VARCHAR(80),"+
+     " `cnt` INT DEFAULT 0,"+
+     " PRIMARY KEY (`address`,`keyhash`) )"
+   ); })
+   // current explorer balance per address (refreshed on each signature scan)
+   .then(function(){ return sql("CREATE TABLE IF NOT EXISTS `addrbal` (`address` VARCHAR(160) PRIMARY KEY, `balance` VARCHAR(80))"); })
    // pre-0.1.9 installs: add the txdate column (used for date search) if missing
    .then(function(){ return sql("ALTER TABLE `txns` ADD COLUMN IF NOT EXISTS `txdate` VARCHAR(32)").catch(function(){}); })
    // index the default sort/scan column so paging stays fast on very large histories
@@ -201,7 +215,7 @@ function setProg(p){ document.getElementById("progBar").style.width=Math.max(0,M
 function showProg(on){ document.getElementById("prog").classList.toggle("hidden",!on); if(on) setProg(0); }
 function setBusy(b){
   state.busy=b;
-  ["reconBtn","scriptsBtn","backfillBtn","resyncBtn"].forEach(function(id){ var el=document.getElementById(id); if(el) el.disabled=b; });
+  ["reconBtn","scriptsBtn","backfillBtn","resyncBtn","sigScanBtn"].forEach(function(id){ var el=document.getElementById(id); if(el) el.disabled=b; });
   document.getElementById("stopBtn").classList.toggle("hidden",!b);
 }
 function updateButtons(){
@@ -288,6 +302,133 @@ function scanAddress(addr, since, onSeen, onPage){
     });
   }
   return nextPage();
+}
+
+/* ---------- signature-key analysis (ported from MinimaTransactionMonitor.java) ----------
+   For each input spent from an address we read the witness and pull two public keys:
+     Level 1 = the signature whose rootkey matches SIGNEDBY(<rootkey>) in the input's script
+     Level 3 = the public key at index 2 of that input's signature group
+   We key usage by rootkey|level1|level3 and count how many inputs used each combo.
+   "Total uses" for an address = sum of all counts. "Reused" = combos with count >= 2. */
+function normHex(h){ if(h==null) return ""; h=String(h); if(h.slice(0,2)==="0x"||h.slice(0,2)==="0X") h=h.slice(2); return h.toUpperCase(); }
+function inputIndicesForAddr(doc, addr){
+  var idx=[], txn=(doc.body||{}).txn||{}, inputs=txn.inputs||[], A=String(addr).trim();
+  for(var i=0;i<inputs.length;i++){ var m=inputs[i]&&inputs[i].miniaddress; if(m!=null && String(m).trim()===A) idx.push(i); }
+  return idx;
+}
+function scriptForInput(witness, i){
+  var arr=witness&&witness.scripts; if(!arr||i<0||i>=arr.length) return null;
+  var s=arr[i]; return s&&s.script!=null?String(s.script):null;
+}
+function rootKeyFromScript(script){
+  if(!script) return null; var p=script.indexOf("SIGNEDBY("); if(p<0) return null;
+  var start=p+9, end=script.indexOf(")",start); if(end<0) return null;
+  var rk=script.slice(start,end).trim(); return (rk.slice(0,2)==="0x"||rk.slice(0,2)==="0X")?rk:null;
+}
+function level1ByRootKey(witness, targetRoot, i){
+  var arr=witness&&witness.signatures; if(!arr) return null; var want=normHex(targetRoot);
+  function scan(g){ var inner=g&&g.signatures; if(!inner) return null;
+    for(var j=0;j<inner.length;j++){ var s=inner[j]; if(s&&s.rootkey!=null&&normHex(s.rootkey)===want&&s.publickey!=null) return normHex(s.publickey); } return null; }
+  if(i>=0&&i<arr.length){ var r=scan(arr[i]); if(r) return r; }
+  for(var k=0;k<arr.length;k++){ var r2=scan(arr[k]); if(r2) return r2; }
+  return null;
+}
+function level3ByIndex(witness, i){
+  var arr=witness&&witness.signatures; if(!arr) return null;
+  function pick(g){ var inner=g&&g.signatures; if(inner&&inner.length>2&&inner[2]&&inner[2].publickey!=null) return normHex(inner[2].publickey); return null; }
+  if(i>=0&&i<arr.length){ var r=pick(arr[i]); if(r) return r; }
+  for(var k=0;k<arr.length;k++){ var r2=pick(arr[k]); if(r2) return r2; }
+  return null;
+}
+/* tally combos for one address into the provided map: keyhash -> {rootkey,level1,pubkey,cnt} */
+function tallyDoc(doc, addr, map){
+  var idxs=inputIndicesForAddr(doc, addr); if(!idxs.length) return 0;
+  var witness=(doc.body||{}).witness; if(!witness) return 0;
+  var added=0;
+  idxs.forEach(function(i){
+    var script=scriptForInput(witness,i); if(!script) return;
+    var root=rootKeyFromScript(script); if(!root) return;
+    var l1=level1ByRootKey(witness, root, i), l3=level3ByIndex(witness, i);
+    if(!l1||!l3) return;
+    var rk=normHex(root), key=rk+"|"+l1+"|"+l3;
+    var e=map[key]||(map[key]={rootkey:rk,level1:l1,pubkey:l3,cnt:0});
+    e.cnt++; added++;
+  });
+  return added;
+}
+var SIGKEY_HEAD="MERGE INTO sigkeys (address,keyhash,rootkey,level1,pubkey,cnt) KEY(address,keyhash) VALUES ";
+function persistSigkeys(addr, map){
+  var rows=Object.keys(map); if(!rows.length) return Promise.resolve();
+  var chain=Promise.resolve();
+  for(var i=0;i<rows.length;i+=MERGE_CHUNK){
+    (function(slice){ chain=chain.then(function(){
+      var vals=slice.map(function(k){ var e=map[k];
+        return "("+S(addr)+","+S(k)+","+S(e.rootkey)+","+S(e.level1)+","+S(e.pubkey)+","+N(e.cnt)+")"; }).join(",");
+      return sql(SIGKEY_HEAD+vals);
+    }); })(rows.slice(i,i+MERGE_CHUNK));
+  }
+  return chain;
+}
+/* scan witness for one address across all its explorer pages, then write per-combo counts */
+function scanAddressSignatures(addr){
+  var page=1, totalPages=1, map={};
+  function nextPage(){
+    if(state.cancel) return Promise.resolve();
+    return trpc("search.get",{query:addr,filter:"all",page:page,perPage:PER_PAGE}).then(function(r){
+      var hits=r.hits||[];
+      if(page===1){
+        totalPages=Math.max(1,Math.ceil((r.found||0)/PER_PAGE));
+        var maxPages=Math.ceil(ADDR_MAX_TXNS/PER_PAGE);
+        if(totalPages>maxPages){ logp("    capped: "+(r.found||0)+" txns — scanning newest "+ADDR_MAX_TXNS); totalPages=maxPages; }
+      }
+      hits.forEach(function(h){ var doc=h.document; if(doc) tallyDoc(doc, addr, map); });
+      if(state.cancel) return;
+      page++; if(page<=totalPages) return delay(SCAN_THROTTLE).then(nextPage);
+    });
+  }
+  return nextPage().then(function(){
+    return sql("DELETE FROM sigkeys WHERE address="+S(addr)).then(function(){ return persistSigkeys(addr, map); }).then(function(){ return map; });
+  });
+}
+/* current balance of an address from the explorer; stored so the panel can show it without a re-query */
+function fetchAddrBalance(addr){
+  return trpc("address.balance",{address:addr}).then(function(r){
+    var bal=(r&&r.balance!=null)?String(r.balance):"";
+    return sql("MERGE INTO addrbal (address,balance) KEY(address) VALUES ("+S(addr)+","+S(bal)+")").then(function(){ return bal; });
+  }).catch(function(){ return null; });
+}
+function scanSignatures(){
+  if(state.busy) return Promise.resolve();
+  setBusy(true); state.cancel=false; clearStatus(); showProg(true);
+  var list=addrsFor("default"), total=list.length, done=0, totalUses=0, reusedKeys=0;
+  if(!total){ endRun(); showStatus("No default addresses to scan.","ok"); return Promise.resolve(); }
+  logp("Scanning signatures for "+total+" default address(es)…");
+  var chain=Promise.resolve();
+  list.forEach(function(a){
+    var addr=a.miniaddress||a.address, type=a.type||"";
+    chain=chain.then(function(){
+      if(state.cancel) return;
+      logp("▶ ["+(done+1)+"/"+total+"] "+type+"  "+addr);
+      return scanAddressSignatures(addr).then(function(map){
+        var uses=0, reused=0, mx=0;
+        Object.keys(map).forEach(function(k){ var c=map[k].cnt; uses+=c; if(c>=2) reused++; if(c>mx) mx=c; });
+        totalUses+=uses; reusedKeys+=reused;
+        if(uses) logp("    uses "+uses+", reused keys "+reused+", max "+mx);
+        return delay(SCAN_THROTTLE).then(function(){ return fetchAddrBalance(addr); })
+          .then(function(bal){ if(bal!=null) logp("    balance "+bal); });
+      }).catch(function(e){ logp("  ! "+shortAddr(addr)+": "+e.message); });
+    }).then(function(){
+      done++; setProg(done/total*100);
+      var r=(done%REFRESH_EVERY===0)?renderSigs():Promise.resolve();
+      return r.then(function(){ return delay(ADDR_THROTTLE); });
+    });
+  });
+  return chain.then(function(){ return metaSet("sig_scan_done","1"); })
+    .then(function(){
+      logp(state.cancel?("Stopped. "+totalUses+" uses so far."):("Done. "+totalUses+" signature uses, "+reusedKeys+" reused keys."));
+      showStatus(state.cancel?("Signature scan stopped — "+totalUses+" uses (re-run to refresh)."):("Signature scan complete — "+totalUses+" total uses, "+reusedKeys+" reused keys."),"ok");
+    }).catch(function(e){ showStatus("Signature scan error: "+e.message,"error"); logp("ERROR "+e.message); })
+    .then(function(){ endRun(); return renderSigs(); });
 }
 
 /* ---------- archive backfill ---------- */
@@ -509,6 +650,60 @@ function renderPager(count,pages){
   p.appendChild(btn("Next ›",state.page+1,state.page>=pages));
 }
 
+/* ---------- signatures panel ---------- */
+function renderSigs(){
+  // Per-address aggregates straight from SQL: total uses = SUM(cnt), reused keys = COUNT(cnt>=2), max reuse = MAX(cnt).
+  return sql("SELECT k.address AS ADDRESS, SUM(k.cnt) AS USES, COUNT(*) AS KEYS, "+
+             "SUM(CASE WHEN k.cnt>=2 THEN 1 ELSE 0 END) AS REUSED, MAX(k.cnt) AS MAXC, b.balance AS BALANCE "+
+             "FROM sigkeys k LEFT JOIN addrbal b ON b.address=k.address GROUP BY k.address, b.balance ORDER BY USES DESC").then(function(rows){
+    var tb=document.getElementById("sigBody"); if(!tb) return;
+    var totUses=0, totReused=0, totKeys=0;
+    rows.forEach(function(r){ totUses+=N(r.USES); totReused+=N(r.REUSED); totKeys+=N(r.KEYS); });
+    document.getElementById("sig-uses").textContent=totUses.toLocaleString();
+    document.getElementById("sig-reused").textContent=totReused.toLocaleString();
+    document.getElementById("sig-keys").textContent=totKeys.toLocaleString();
+    document.getElementById("sigEmpty").classList.toggle("hidden", rows.length>0);
+    tb.innerHTML="";
+    rows.forEach(function(r){
+      var addr=r.ADDRESS, reused=N(r.REUSED), maxc=N(r.MAXC);
+      var bal=(r.BALANCE!=null&&r.BALANCE!=="")?fmtAmt(r.BALANCE):"—";
+      var tr=document.createElement("tr"); tr.className="tx"+(reused?" warn":"");
+      var warn=reused?'<span class="sigwarn" title="Key reused — a signing key was used '+maxc+' times">⚠ key reused ×'+maxc+'</span>':'';
+      tr.innerHTML=
+        '<td data-label="Address"><span class="mono sigaddr">'+esc(addr)+'</span>'+warn+'</td>'+
+        '<td data-label="Balance" class="amt">'+bal+'</td>'+
+        '<td data-label="Total uses" class="amt">'+N(r.USES).toLocaleString()+'</td>'+
+        '<td data-label="Distinct keys">'+N(r.KEYS).toLocaleString()+'</td>'+
+        '<td data-label="Reused keys"><span class="'+(reused?"amt out":"")+'">'+reused.toLocaleString()+'</span></td>'+
+        '<td data-label="Max reuse">'+maxc.toLocaleString()+'</td>';
+      tr.addEventListener("click",function(){ toggleSigDetail(tr, addr); });
+      tb.appendChild(tr);
+    });
+  }).catch(function(e){ MDS.log("[myHistory] renderSigs error: "+e.message); });
+}
+function toggleSigDetail(tr, addr){
+  var nxt=tr.nextElementSibling;
+  if(nxt&&nxt.classList.contains("detailrow")){ nxt.remove(); return; }
+  var dr=document.createElement("tr"); dr.className="detailrow";
+  var td=document.createElement("td"); td.className="detail"; td.colSpan=6; dr.appendChild(td);
+  tr.parentNode.insertBefore(dr, tr.nextElementSibling);
+  td.innerHTML='<span class="spin"></span>loading keys…';
+  // show only reused keys (cnt>=2), the most-used first
+  sql("SELECT pubkey,level1,rootkey,cnt FROM sigkeys WHERE address="+S(addr)+" AND cnt>=2 ORDER BY cnt DESC").then(function(rows){
+    if(!rows.length){ td.innerHTML='<div class="blk"><pre>no reused keys for this address (every signing key used once)</pre></div>'; return; }
+    var h='<div class="blk"><h4>Reused signing keys ('+rows.length+')</h4>';
+    rows.forEach(function(r){
+      h+='<div class="kv">'+
+         '<span class="k">used</span><span class="val">×'+N(r.CNT)+'</span>'+
+         '<span class="k">rootkey</span><span class="val">'+esc(r.ROOTKEY)+'</span>'+
+         '<span class="k">level 1</span><span class="val">'+esc(r.LEVEL1)+'</span>'+
+         '<span class="k">level 3 pubkey</span><span class="val">'+esc(r.PUBKEY)+'</span>'+
+         '</div>';
+    });
+    td.innerHTML=h+'</div>';
+  }).catch(function(e){ td.innerHTML='<span style="color:var(--err)">'+esc(e.message)+'</span>'; });
+}
+
 /* ---------- status / stats ---------- */
 function showStatus(m,k){ var el=document.getElementById("statusBox"); el.textContent=m; el.className="status show "+(k||""); }
 function clearStatus(){ var el=document.getElementById("statusBox"); el.className="status"; el.textContent=""; }
@@ -521,7 +716,7 @@ function refresh(){
     document.getElementById("s-count").textContent=total.toLocaleString();
     document.getElementById("s-addr").textContent=state.addrList.length;
     updateButtons();
-    return populateTokens().then(render).then(updateHeader);
+    return populateTokens().then(render).then(updateHeader).then(renderSigs);
   });
 }
 /* distinct token list for the filter dropdown — derived in SQL (few distinct rows), not from a full load */
@@ -563,6 +758,7 @@ function init(){
   document.getElementById("scriptsBtn").onclick=function(){ reconstruct({scope:"script"}); };
   document.getElementById("backfillBtn").onclick=function(){ backfillArchive(); };
   document.getElementById("resyncBtn").onclick=function(){ incremental(); };
+  document.getElementById("sigScanBtn").onclick=function(){ scanSignatures(); };
   document.getElementById("stopBtn").onclick=function(){ state.cancel=true; logp("Stopping…"); };
   document.getElementById("exportCsvBtn").onclick=function(){ doExport("csv"); };
   document.getElementById("exportJsonBtn").onclick=function(){ doExport("json"); };

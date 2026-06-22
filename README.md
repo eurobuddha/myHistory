@@ -15,6 +15,8 @@ local history.
 - **Export** the rows matching your current filters to **CSV** or **JSON**.
 - New transactions are appended automatically after the first run.
 - Optional coin-level **backfill from an archive node** for pre-explorer history.
+- **Signature key-usage check** — counts how many times each signing key spent from your
+  addresses and flags reused keys.
 - Responsive UI, mobile → 4K.
 
 ## Install
@@ -22,7 +24,7 @@ local history.
 Grab a build from [Releases](../../releases) and install it on your node:
 
 ```
-mds action:install file:myhistory-0.2.1.mds.zip
+mds action:install file:myhistory-0.2.2.mds.zip
 ```
 
 ## Build from source
@@ -33,6 +35,7 @@ zip -r myhistory.mds.zip dapp.conf index.html app.js mds.js icon.svg
 
 ## Versions
 
+- **0.2.2** — adds a signature key-usage check (per-address key-use counts; flags reused signing keys).
 - **0.2.1** — adds CSV / JSON export of the filtered history.
 - **0.2.0** — summary history line; reconstructs default-wallet + contract/script
   addresses, fully SQL-backed search and paging.

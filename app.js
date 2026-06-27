@@ -1,4 +1,4 @@
-/* myHistory v0.2.2 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory v0.2.5 — reconstruct & maintain a node's transaction history (summary).
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
    Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
@@ -6,8 +6,9 @@
 (function(){
 "use strict";
 
-var VERSION   = "0.2.2";   // fallback only — real display is read from dapp.conf at runtime
-var EXPLORER  = "https://block.minima.global";
+var VERSION   = "0.2.5";   // displayed version — keep in sync via the 4-spot build checklist
+var EXPLORER  = "https://block.minima.global";        // tRPC API host (search.get, address.balance)
+var EXPLORER_WEB = "https://explorer.minima.global";  // human-facing explorer — tx page is /transactions/<txid>
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
 var PER_PAGE  = 1;       // ONE doc per request (~50KB). search.get docs are large (no CORS to
                          // offload, no field-exclude), so the NODE downloads each page — tiny pages keep an
@@ -22,6 +23,7 @@ var ARCHIVE_CUTOFF = 1000000;
 var SEARCH_DEBOUNCE = 300;    // ms — wait after typing before running the (full-table) SQL search
 var MIGRATE_BATCH = 200;      // rows per txdate backfill statement (one-time, for pre-0.1.9 installs)
 var ADDR_MAX_TXNS = 20000;    // per-address scan cap — beyond this, scan only the newest N (protects vs huge contracts)
+var LOCAL_HISTORY_MAX = 200;  // newest local txns read per resync (MDS history relevant:true) — covers normal deltas; gap-fallback handles more
 var DEFAULT_WALLET_SCRIPT_RE = /^\s*RETURN\s+SIGNEDBY\s*\(\s*0x[0-9a-fA-F]+\s*\)\s*$/i;
 
 var state = {
@@ -148,12 +150,15 @@ function enumerateAddresses(){
     scripts=scripts||[];
     var set=new Set(), list=[], seen=new Set();
     scripts.forEach(function(s){
-      if(!s || !(s.address||s.miniaddress)) return;      // ALL tracked: default wallet + newaddress + contracts
-      var isDef=DEFAULT_WALLET_SCRIPT_RE.test(s.script||"");
+      if(!s || !(s.address||s.miniaddress)) return;
+      // DEFAULT WALLET ONLY: tracked contract/newaddress scripts are SHARED (e.g. the FutureCash
+      // maximize-stake address everyone's coins sit under) — including them pulls in other people's
+      // transactions and mis-attributes them as yours. Skip anything that isn't a seed-derived key.
+      if(!DEFAULT_WALLET_SCRIPT_RE.test(s.script||"")) return;
       if(s.address) set.add(String(s.address).toUpperCase());
       if(s.miniaddress) set.add(String(s.miniaddress).toUpperCase());
       var key=s.miniaddress||s.address;
-      if(key && !seen.has(key)){ seen.add(key); list.push({address:s.address||"", miniaddress:s.miniaddress||s.address, type:isDef?"default":"script"}); }
+      if(key && !seen.has(key)){ seen.add(key); list.push({address:s.address||"", miniaddress:s.miniaddress||s.address, type:"default"}); }
     });
     state.addrSet=set; state.addrList=list;
     return sql("DELETE FROM myaddr").then(function(){
@@ -172,6 +177,13 @@ function addrsFor(scope){
 
 /* ---------- classify ---------- */
 function isMine(a){ return a && state.addrSet.has(String(a).toUpperCase()); }
+/* True only if one of MY default-wallet addresses actually owns a coin (input or output) in this
+   tx. Guards against shared-contract txns that merely reference my address in state/proofs, or
+   that the node tracks via a shared script address — those are not mine to record. */
+function docTouchesMine(doc){
+  return (doc.input_addresses||[]).concat(doc.input_mini_addresses||[],
+          doc.output_addresses||[], doc.output_mini_addresses||[]).some(isMine);
+}
 function classify(doc){
   var inA=(doc.input_addresses||[]).concat(doc.input_mini_addresses||[]);
   var outA=(doc.output_addresses||[]).concat(doc.output_mini_addresses||[]);
@@ -201,6 +213,23 @@ function tupleForDoc(doc){
   return "("+S(doc.txpow_id)+","+N(doc.block_number)+","+N(doc.datetime)+","+S(fmtDate(N(doc.datetime)))+","+S(c.direction)+","+
     S(c.in_amount)+","+S(c.out_amount)+","+S(c.net)+","+S(c.tokenids)+","+S(c.counterparties)+",NULL,'explorer')";   // 12-col
 }
+/* Map a LOCAL node txpow (from `history relevant:true`) into the explorer-document
+   shape classify()/tupleForDoc() consume — so the incremental path reuses one code path. */
+function docFromLocalTxpow(tp){
+  var txn=(tp.body||{}).txn||{}, ins=txn.inputs||[], outs=txn.outputs||[];
+  var tids={}; outs.forEach(function(o){ if(o&&o.tokenid) tids[o.tokenid]=1; });
+  return {
+    txpow_id: tp.txpowid,
+    block_number: (tp.header||{}).block,
+    datetime: (tp.header||{}).timemilli,
+    input_addresses: ins.map(function(i){ return i.address; }),
+    input_mini_addresses: ins.map(function(i){ return i.miniaddress; }),
+    output_addresses: outs.map(function(o){ return o.address; }),
+    output_mini_addresses: outs.map(function(o){ return o.miniaddress; }),
+    output_amounts: outs.map(function(o){ return o.amount; }),
+    token_ids: Object.keys(tids)
+  };
+}
 function batchMerge(tuples){
   var c2=Promise.resolve();
   for(var i=0;i<tuples.length;i+=MERGE_CHUNK){
@@ -215,26 +244,19 @@ function setProg(p){ document.getElementById("progBar").style.width=Math.max(0,M
 function showProg(on){ document.getElementById("prog").classList.toggle("hidden",!on); if(on) setProg(0); }
 function setBusy(b){
   state.busy=b;
-  ["reconBtn","scriptsBtn","backfillBtn","resyncBtn","sigScanBtn"].forEach(function(id){ var el=document.getElementById(id); if(el) el.disabled=b; });
+  ["reconBtn","backfillBtn","resyncBtn","sigScanBtn"].forEach(function(id){ var el=document.getElementById(id); if(el) el.disabled=b; });
   document.getElementById("stopBtn").classList.toggle("hidden",!b);
 }
 function updateButtons(){
-  var nd=addrsFor("default").length, ns=addrsFor("script").length;
+  var nd=addrsFor("default").length;
   var rb=document.getElementById("reconBtn"); if(rb) rb.textContent="Reconstruct now"+(nd?(" ("+nd+")"):"");
-  var sb=document.getElementById("scriptsBtn"); if(sb){ sb.classList.toggle("hidden", ns===0); sb.textContent="Scan contracts/scripts ("+ns+")"; }
 }
 function setVersionDisplay(){
-  var el=document.getElementById("ver"); el.textContent="v"+VERSION;   // fallback
-  try{ MDS.cmd("mds action:list", function(r){
-    try{
-      var list=(r&&r.response&&r.response.minidapps)||[], byUid=null, byName=null;
-      for(var i=0;i<list.length;i++){ var c=list[i].conf||{};
-        if(typeof MDS!=="undefined" && MDS.minidappuid && list[i].uid===MDS.minidappuid && c.version) byUid=c.version;
-        if(c.name==="myHistory" && c.version) byName=c.version;
-      }
-      if(byUid||byName) el.textContent="v"+(byUid||byName);
-    }catch(e){}
-  }); }catch(e){}
+  // Display from the VERSION constant only. We intentionally do NOT call `mds action:list`:
+  // `mds` is a privileged management command that lands in the pending-approval queue when the
+  // dapp is installed in READ mode. The 4-spot build checklist keeps VERSION in sync, and the
+  // app.js?v= cache-bust forces a fresh load after every update, so this never drifts.
+  var el=document.getElementById("ver"); el.textContent="v"+VERSION;
 }
 function endRun(){ setBusy(false); state.cancel=false; }
 
@@ -248,6 +270,10 @@ function reconstruct(opts){
   logp("Scanning "+total+" "+scope+" address(es)"+(since?(" since block "+since):" (full)")+"…");
 
   var chain=Promise.resolve();
+  if(opts.clean){   // full rebuild: drop prior explorer rows first (keep archive), so removed/foreign txns don't linger
+    chain=chain.then(function(){ return sql("DELETE FROM txns WHERE source='explorer'"); })
+      .then(function(){ logp("Cleared previous explorer rows for a clean rebuild."); return refresh(); });
+  }
   list.forEach(function(a){
     var addr=a.miniaddress||a.address, type=a.type||"";
     chain=chain.then(function(){
@@ -269,6 +295,7 @@ function reconstruct(opts){
   return chain.then(function(){
     if(maxBlock) return metaGet("last_block").then(function(lb){ return metaSet("last_block", String(Math.max(N(lb),maxBlock))); });
   }).then(function(){ return metaSet("reconstruct_done","1"); })
+    .then(function(){ if(opts.clean && !state.cancel) return metaSet("scope_ver","2"); })   // default-wallet-only rebuild done
     .then(function(){ if(maxBlock) return metaSet("tip_at_build",String(maxBlock)); })
     .then(function(){
       logp(state.cancel?("Stopped. "+found+" seen so far."):("Done. "+found+" transaction(s) processed."));
@@ -291,6 +318,7 @@ function scanAddress(addr, since, onSeen, onPage){
       hits.forEach(function(h){
         var doc=h.document; if(!doc||!doc.txpow_id) return;
         if(since && N(doc.block_number)<=since){ stop=true; return; }  // sorted desc → reached known
+        if(!docTouchesMine(doc)) return;   // address matched only via state/shared contract — not mine
         if(onSeen) onSeen(N(doc.block_number));
         tuples.push(tupleForDoc(doc));
       });
@@ -473,7 +501,42 @@ function batchArchive(tuples){
 /* ---------- incremental ---------- */
 var incTimer=null;
 function scheduleIncremental(){ if(state.busy) return; clearTimeout(incTimer); incTimer=setTimeout(incremental,1500); }
-function incremental(){ if(state.busy) return Promise.resolve(); return metaGet("last_block").then(function(lb){ return reconstruct({scope:"all", sinceBlock:N(lb)}); }); }
+/* Resync recent — read NEW transactions from the LOCAL node (one MDS.cmd, zero explorer
+   round-trips). Falls back to the explorer reconstruct for a fresh install, an over-cap gap,
+   or any local error. */
+function incremental(){
+  if(state.busy) return Promise.resolve();
+  return Promise.all([metaGet("last_block"), metaGet("reconstruct_done")]).then(function(m){
+    var lb=N(m[0]);
+    if(m[1]!=="1") return reconstruct({scope:"all", sinceBlock:lb});   // no baseline yet → full explorer rebuild
+    setBusy(true); state.cancel=false; clearStatus();
+    return mds("history relevant:true max:"+LOCAL_HISTORY_MAX).then(function(res){
+      var txpows=(res&&res.txpows)||[], tuples=[], maxBlock=0, minBlockSeen=Infinity;
+      txpows.forEach(function(tp){
+        var blk=N((tp.header||{}).block); if(blk<minBlockSeen) minBlockSeen=blk;
+        if(!tp.body || !tp.body.txn || blk<=lb) return;       // skip blocks & already-stored txns
+        var doc=docFromLocalTxpow(tp);
+        if(!docTouchesMine(doc)) return;                      // shared-contract coin the node tracks — not mine
+        tuples.push(tupleForDoc(doc));
+        if(blk>maxBlock) maxBlock=blk;
+      });
+      // local window capped before reaching last_block → may have missed older gap txns
+      if(txpows.length>=LOCAL_HISTORY_MAX && minBlockSeen>lb+1){
+        MDS.log("[myHistory] local window capped → escalating to explorer");
+        setBusy(false); return reconstruct({scope:"all", sinceBlock:lb});
+      }
+      return (tuples.length?batchMerge(tuples):Promise.resolve()).then(function(){
+        if(maxBlock>lb) return metaSet("last_block", String(maxBlock));
+      }).then(function(){
+        if(tuples.length){ MDS.log("[myHistory] +"+tuples.length+" new (local)"); showStatus("Added "+tuples.length+" new transaction(s).","ok"); }
+        setBusy(false); return refresh();
+      });
+    }).catch(function(e){
+      MDS.log("[myHistory] local resync failed ("+e.message+") → explorer");
+      setBusy(false); return reconstruct({scope:"all", sinceBlock:lb});
+    });
+  });
+}
 
 /* ---------- lazy detail: inputs/outputs (from search.get by txid) ---------- */
 function enrich(txpowid, container, row){
@@ -489,26 +552,60 @@ function enrich(txpowid, container, row){
     });
   }).catch(function(e){ container.innerHTML='<span style="color:var(--err)">detail unavailable: '+esc(e.message)+'</span>'; });
 }
+/* Copyable field: full value shown untruncated + a Copy button (mobile-safe). */
+function cfield(label,val){
+  if(val==null||val==="") return "";
+  return '<div class="cf"><span class="cfl">'+esc(label)+'</span>'+
+         '<span class="cv">'+esc(val)+'</span>'+
+         '<button type="button" class="cpy" title="Copy '+esc(label)+'">⧉</button></div>';
+}
+function copyText(t){
+  t=String(t==null?"":t);
+  function fallback(){
+    try{ var ta=document.createElement("textarea"); ta.value=t; ta.setAttribute("readonly","");
+      ta.style.position="fixed"; ta.style.top="0"; ta.style.opacity="0"; document.body.appendChild(ta);
+      ta.focus(); ta.select(); ta.setSelectionRange(0,t.length); document.execCommand("copy");
+      document.body.removeChild(ta); }catch(e){}
+  }
+  try{ if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t).catch(fallback); return; } }catch(e){}
+  fallback();
+}
+/* one delegated handler per detail cell — copies the .cv next to the clicked button */
+function wireCopy(container){
+  container.addEventListener("click",function(e){
+    var b=e.target; if(!b||!b.classList||!b.classList.contains("cpy")) return;
+    e.stopPropagation();
+    var cv=b.previousElementSibling; if(!cv) return;
+    copyText(cv.textContent);
+    var o=b.textContent; b.textContent="✓"; b.classList.add("ok");
+    setTimeout(function(){ b.textContent=o; b.classList.remove("ok"); },900);
+  });
+}
 function coinBlock(arr,label){
   if(!arr||!arr.length) return "";
   var h='<div class="blk"><h4>'+label+' ('+arr.length+')</h4>';
   arr.forEach(function(c){
-    h+='<pre>'+esc((c.miniaddress||c.address||"")+"  "+(c.amount!=null?c.amount:"")+
-        (c.tokenid&&c.tokenid!=="0x00"?(" ["+String(c.tokenid).slice(0,12)+"…]"):"")+
-        (c.coinid?("  coin "+String(c.coinid).slice(0,14)+"…"):""))+'</pre>';
+    h+='<div class="coin">';
+    h+=cfield("address", c.miniaddress||c.address||"");
+    if(c.amount!=null) h+=cfield("amount", c.amount);
+    if(c.tokenid && c.tokenid!=="0x00") h+=cfield("token", c.tokenid);
+    if(c.coinid) h+=cfield("coin", c.coinid);
+    h+='</div>';
   });
   return h+'</div>';
 }
 function renderDetail(container, d){
-  if(d.archive){ container.innerHTML='<div class="blk"><h4>Archive coin (coin-level)</h4><pre>'+esc(JSON.stringify(d.coin,null,1))+'</pre></div>'; return; }
+  if(d.archive){ container.innerHTML='<div class="blk"><h4>Archive coin (coin-level)</h4><pre>'+esc(JSON.stringify(d.coin,null,1))+'</pre></div>'; wireCopy(container); return; }
   var txn=(d.body||{}).txn||{};
   var h="";
+  if(d.txpow_id){ h+='<div class="blk"><h4>Transaction</h4>'+cfield("txid", d.txpow_id)+'</div>'; }
   h+=coinBlock(txn.inputs,"Inputs");
   h+=coinBlock(txn.outputs,"Outputs");
-  if(txn.state && txn.state.length){ h+='<div class="blk"><h4>State</h4><pre>'+esc(JSON.stringify(txn.state))+'</pre></div>'; }
+  if(txn.state && txn.state.length){ h+='<div class="blk"><h4>State</h4>'+cfield("state", JSON.stringify(txn.state))+'</div>'; }
   if(!txn.inputs && !txn.outputs){ h+='<div class="blk"><pre>no input/output detail available</pre></div>'; }
-  h+='<div class="blk"><a href="'+EXPLORER+'/txpow/'+esc(d.txpow_id)+'" target="_blank" rel="noopener">Open on block.minima.global ↗</a></div>';
+  h+='<div class="blk"><a href="'+EXPLORER_WEB+'/transactions/'+esc(d.txpow_id)+'" target="_blank" rel="noopener">Open on explorer.minima.global ↗</a></div>';
   container.innerHTML=h;
+  wireCopy(container);
 }
 
 /* ---------- rendering ---------- */
@@ -754,8 +851,7 @@ function syncFilterUI(){
 /* ---------- init ---------- */
 function init(){
   setVersionDisplay();
-  document.getElementById("reconBtn").onclick=function(){ reconstruct({scope:"default"}); };
-  document.getElementById("scriptsBtn").onclick=function(){ reconstruct({scope:"script"}); };
+  document.getElementById("reconBtn").onclick=function(){ reconstruct({scope:"default", clean:true}); };
   document.getElementById("backfillBtn").onclick=function(){ backfillArchive(); };
   document.getElementById("resyncBtn").onclick=function(){ incremental(); };
   document.getElementById("sigScanBtn").onclick=function(){ scanSignatures(); };
@@ -780,9 +876,12 @@ function init(){
     .then(createTables)
     .then(enumerateAddresses)
     .then(refresh)
-    .then(function(){ return metaGet("reconstruct_done"); })
-    .then(function(done){
-      if(done==="1") showStatus("History loaded. New transactions are added automatically.","ok");
+    .then(function(){ return Promise.all([metaGet("reconstruct_done"), metaGet("scope_ver")]); })
+    .then(function(m){
+      var done=m[0], scopeVer=m[1];
+      if(done==="1" && scopeVer!=="2")   // upgraded to default-wallet-only scope; old DB may hold tracked-contract rows
+        showStatus("Updated to default-wallet only. Click Reconstruct now to remove tracked-contract transactions that aren't yours.","");
+      else if(done==="1") showStatus("History loaded. New transactions are added automatically.","ok");
       else showStatus("No history yet — click Reconstruct now to rebuild from block.minima.global.","");
       migrateTxdate().then(function(){ if(state.filters.q) render(); });  // backfill old rows' search dates in the background
     })

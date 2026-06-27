@@ -7,13 +7,16 @@ local history.
 
 ## Features
 
-- Reconstructs history for your **default wallet** addresses, plus tracked
-  **contract / script** addresses (run as a separate pass).
+- Reconstructs history for your **default wallet** addresses (seed-derived keys only —
+  shared contract/script addresses are excluded, so other people's activity never shows up).
 - Stores everything in the node's local H2 database — **searchable, sortable, paged**,
   with no size cap on the stored history.
-- Per-transaction detail on row expand: **inputs / outputs / state**.
+- Per-transaction detail on row expand: **inputs / outputs / state**, each field
+  **copyable**, with a link to the transaction on explorer.minima.global.
 - **Export** the rows matching your current filters to **CSV** or **JSON**.
-- New transactions are appended automatically after the first run.
+- New transactions are appended automatically and **live from your local node**
+  (no explorer round-trip) — the explorer is used only for the initial/manual rebuild.
+- Runs cleanly in **READ mode** — issues no privileged node commands, so no approval prompts.
 - Optional coin-level **backfill from an archive node** for pre-explorer history.
 - **Signature key-usage check** — counts how many times each signing key spent from your
   addresses and flags reused keys.
@@ -24,7 +27,7 @@ local history.
 Grab a build from [Releases](../../releases) and install it on your node:
 
 ```
-mds action:install file:myhistory-0.2.2.mds.zip
+mds action:install file:myhistory-0.2.5.mds.zip
 ```
 
 ## Build from source
@@ -35,6 +38,12 @@ zip -r myhistory.mds.zip dapp.conf index.html app.js mds.js icon.svg
 
 ## Versions
 
+- **0.2.5** — runs clean in READ mode (no privileged node commands / approval prompts).
+- **0.2.4** — default-wallet-only scope: excludes shared contract/script addresses (e.g. the
+  FutureCash maximize-stake contract) so other people's transactions no longer appear; clean
+  rebuild on "Reconstruct now"; fixed explorer link.
+- **0.2.3** — fast "Resync recent" reads new transactions from the local node (zero explorer
+  round-trips); copyable fields in the detail view.
 - **0.2.2** — adds a signature key-usage check (per-address key-use counts; flags reused signing keys).
 - **0.2.1** — adds CSV / JSON export of the filtered history.
 - **0.2.0** — summary history line; reconstructs default-wallet + contract/script

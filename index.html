@@ -77,6 +77,14 @@
   .detail h4{margin:0 0 6px;font-size:.85em;color:var(--text);text-transform:uppercase;letter-spacing:.04em}
   .detail .blk{margin-bottom:14px}
   .detail pre{margin:0 0 4px;white-space:pre-wrap;word-break:break-all;font-size:.85em;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
+  .detail .coin{padding:6px 0;border-bottom:1px solid var(--line,rgba(255,255,255,.06))}
+  .detail .coin:last-child{border-bottom:0}
+  .cf{display:grid;grid-template-columns:64px 1fr auto;gap:4px 10px;align-items:start;margin:2px 0}
+  .cf .cfl{color:var(--dim);font-size:.8em;text-transform:uppercase;letter-spacing:.03em;padding-top:2px}
+  .cf .cv{word-break:break-all;font-size:.85em;font-family:ui-monospace,Menlo,monospace;-webkit-user-select:all;user-select:all}
+  .cf .cpy{cursor:pointer;border:1px solid var(--line,rgba(255,255,255,.15));background:transparent;color:var(--dim);
+           border-radius:6px;font-size:.85em;line-height:1;padding:3px 7px;min-width:34px;min-height:28px}
+  .cf .cpy:hover{color:var(--text)} .cf .cpy.ok{color:#2ecc71;border-color:#2ecc71}
   .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:.85em}
   .kv .k{color:var(--dim)} .kv .val{word-break:break-all;font-family:ui-monospace,Menlo,monospace}
   .sig{max-height:3em;overflow:hidden;cursor:pointer}
@@ -125,7 +133,6 @@
        are added automatically. Older history can be backfilled from an archive node.</p>
     <div class="row">
       <button id="reconBtn">Reconstruct now</button>
-      <button class="ghost hidden" id="scriptsBtn">Scan contracts/scripts</button>
       <button class="ghost" id="resyncBtn">Resync recent</button>
       <button class="ghost" id="sigScanBtn">Scan signatures</button>
       <button class="ghost" id="backfillBtn">Backfill pre-2024 (archive)</button>
@@ -136,7 +143,7 @@
       <div class="plog" id="progLog"></div>
     </div>
     <div id="statusBox" class="status"></div>
-    <div class="legend"><b>Reconstruct now</b> scans your default wallet addresses first (fast). <b>Scan contracts/scripts</b> covers tracked contract &amp; newaddress scripts as a separate pass (can be large/slow). New transactions are added automatically afterward. Expanding a row shows inputs/outputs.
+    <div class="legend"><b>Reconstruct now</b> rebuilds your <b>default wallet</b> history from block.minima.global (shared contract/script addresses are excluded — their activity isn't yours). <b>Resync recent</b> adds new transactions from your node. New transactions are also added automatically. Expanding a row shows inputs/outputs.
       <span class="src">explorer</span> · <span class="src">archive</span> coin-level only.</div>
   </div>
 
@@ -208,6 +215,6 @@
 </div>
 
 <script type="text/javascript" src="mds.js"></script>
-<script src="app.js?v=0.2.2"></script>
+<script src="app.js?v=0.2.5"></script>
 </body>
 </html>

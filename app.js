@@ -1,4 +1,4 @@
-/* myHistory v0.2.5 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory v0.2.6 — reconstruct & maintain a node's transaction history (summary).
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
    Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
@@ -6,7 +6,7 @@
 (function(){
 "use strict";
 
-var VERSION   = "0.2.5";   // displayed version — keep in sync via the 4-spot build checklist
+var VERSION   = "0.2.6";   // displayed version — keep in sync via the 4-spot build checklist
 var EXPLORER  = "https://block.minima.global";        // tRPC API host (search.get, address.balance)
 var EXPLORER_WEB = "https://explorer.minima.global";  // human-facing explorer — tx page is /transactions/<txid>
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
@@ -186,14 +186,26 @@ function docTouchesMine(doc){
 }
 function classify(doc){
   var inA=(doc.input_addresses||[]).concat(doc.input_mini_addresses||[]);
-  var outA=(doc.output_addresses||[]).concat(doc.output_mini_addresses||[]);
-  var mineIn=inA.some(isMine), mineOut=outA.some(isMine);
-  var oa=doc.output_addresses||[], oma=doc.output_mini_addresses||[], amts=doc.output_amounts||[];
-  var toMine=0,toOthers=0,cps=[];
-  for(var i=0;i<amts.length;i++){
-    var mine=isMine(oa[i])||isMine(oma[i]); var amt=N(amts[i]);
-    if(mine){ toMine+=amt; } else { toOthers+=amt; var cp=oma[i]||oa[i]; if(cp&&cps.indexOf(cp)<0) cps.push(cp); }
+  // Amounts MUST come from the per-coin outputs in body.txn (one entry per coin). The search.get
+  // summary arrays (output_addresses/output_mini_addresses) hold DISTINCT addresses while
+  // output_amounts is per-coin, so index-pairing them miscounts any tx whose outputs repeat an
+  // address — e.g. a 10×500k split to one address counted as a single 500k. Index pairing is
+  // kept only as a fallback for docs with no body.
+  var outs=((doc.body||{}).txn||{}).outputs, recs;
+  if(outs&&outs.length){
+    recs=outs.map(function(o){ o=o||{}; return {a:o.address, m:o.miniaddress, amt:N(o.amount)}; });
+  } else {
+    var oa=doc.output_addresses||[], oma=doc.output_mini_addresses||[], amts=doc.output_amounts||[];
+    recs=amts.map(function(v,i){ return {a:oa[i], m:oma[i], amt:N(v)}; });
   }
+  var mineIn=inA.some(isMine);
+  var mineOut=(doc.output_addresses||[]).concat(doc.output_mini_addresses||[]).some(isMine)
+           || recs.some(function(r){ return isMine(r.a)||isMine(r.m); });
+  var toMine=0,toOthers=0,cps=[];
+  recs.forEach(function(r){
+    if(isMine(r.a)||isMine(r.m)){ toMine+=r.amt; }
+    else { toOthers+=r.amt; var cp=r.m||r.a; if(cp&&cps.indexOf(cp)<0) cps.push(cp); }
+  });
   var dir=mineIn&&mineOut?"self":mineIn?"out":"in";
   var net=dir==="in"?toMine:-toOthers;
   if(dir==="in"&&!cps.length){ (doc.input_mini_addresses||doc.input_addresses||[]).forEach(function(a){ if(!isMine(a)&&cps.indexOf(a)<0) cps.push(a); }); }
@@ -227,7 +239,8 @@ function docFromLocalTxpow(tp){
     output_addresses: outs.map(function(o){ return o.address; }),
     output_mini_addresses: outs.map(function(o){ return o.miniaddress; }),
     output_amounts: outs.map(function(o){ return o.amount; }),
-    token_ids: Object.keys(tids)
+    token_ids: Object.keys(tids),
+    body: { txn: { inputs: ins, outputs: outs } }   // per-coin outputs → classify()'s accurate path
   };
 }
 function batchMerge(tuples){
@@ -295,7 +308,7 @@ function reconstruct(opts){
   return chain.then(function(){
     if(maxBlock) return metaGet("last_block").then(function(lb){ return metaSet("last_block", String(Math.max(N(lb),maxBlock))); });
   }).then(function(){ return metaSet("reconstruct_done","1"); })
-    .then(function(){ if(opts.clean && !state.cancel) return metaSet("scope_ver","2"); })   // default-wallet-only rebuild done
+    .then(function(){ if(opts.clean && !state.cancel) return metaSet("scope_ver","2").then(function(){ return metaSet("amt_ver","1"); }); })   // default-wallet-only + per-coin-amount rebuild done
     .then(function(){ if(maxBlock) return metaSet("tip_at_build",String(maxBlock)); })
     .then(function(){
       logp(state.cancel?("Stopped. "+found+" seen so far."):("Done. "+found+" transaction(s) processed."));
@@ -876,11 +889,13 @@ function init(){
     .then(createTables)
     .then(enumerateAddresses)
     .then(refresh)
-    .then(function(){ return Promise.all([metaGet("reconstruct_done"), metaGet("scope_ver")]); })
+    .then(function(){ return Promise.all([metaGet("reconstruct_done"), metaGet("scope_ver"), metaGet("amt_ver")]); })
     .then(function(m){
-      var done=m[0], scopeVer=m[1];
+      var done=m[0], scopeVer=m[1], amtVer=m[2];
       if(done==="1" && scopeVer!=="2")   // upgraded to default-wallet-only scope; old DB may hold tracked-contract rows
         showStatus("Updated to default-wallet only. Click Reconstruct now to remove tracked-contract transactions that aren't yours.","");
+      else if(done==="1" && amtVer!=="1")   // pre-0.2.6 rows undercount multi-coin (split) amounts
+        showStatus("This update fixes amounts for multi-coin transactions. Click Reconstruct now to recalculate your history.","");
       else if(done==="1") showStatus("History loaded. New transactions are added automatically.","ok");
       else showStatus("No history yet — click Reconstruct now to rebuild from block.minima.global.","");
       migrateTxdate().then(function(){ if(state.filters.q) render(); });  // backfill old rows' search dates in the background

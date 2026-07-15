@@ -1,28 +1,33 @@
-/* myHistory v0.2.6 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory XL v0.2.6-xl — PERSONAL build for wallets with a very large NUMBER OF KEYS
+   (10,000+), each with few transactions. Derived from myHistory v0.2.6. Differences:
+   2 addresses scanned in parallel, retry-once per request, fast throttles with an
+   empty-address fast path, NO per-address txn cap, 10 docs per request (assumes a DESKTOP
+   node), chunked address bookkeeping, sparser table refresh. NOT for the store.
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
-   Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
    the app.js?v= cache-bust in index.html, and this header comment. */
 (function(){
 "use strict";
 
-var VERSION   = "0.2.6";   // displayed version — keep in sync via the 4-spot build checklist
+var VERSION   = "0.2.6-xl";   // displayed version — keep in sync via the 4-spot build checklist
 var EXPLORER  = "https://block.minima.global";        // tRPC API host (search.get, address.balance)
 var EXPLORER_WEB = "https://explorer.minima.global";  // human-facing explorer — tx page is /transactions/<txid>
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
-var PER_PAGE  = 1;       // ONE doc per request (~50KB). search.get docs are large (no CORS to
-                         // offload, no field-exclude), so the NODE downloads each page — tiny pages keep an
-                         // Android/mobile node's heap from OOMing. Slower, but it survives.
-var SCAN_THROTTLE = 400; // ms between requests — gives the mobile JVM time to GC
-var ADDR_THROTTLE = 400; // ms between addresses
-var REFRESH_EVERY = 10;  // re-query/redraw the table only every N addresses during a scan (SELECT is heavy on mobile)
+var PER_PAGE  = 10;      // XL: 10 docs per request — assumes a DESKTOP node's heap. (The store
+                         // build uses 1 so Android/mobile nodes survive; keep that if backporting.)
+var SCAN_THROTTLE = 150; // XL: desktop node — fast paging
+var ADDR_THROTTLE = 150; // XL: ms after an address that HAD transactions
+var ADDR_THROTTLE_EMPTY = 50; // XL: ms after an empty address — with 10,000 mostly-empty keys this dominates
+var XL_WORKERS = 2;      // XL: addresses scanned in parallel (kept low to stay polite to the explorer)
+var RETRY_DELAY = 1500;  // XL: ms before the single retry of a failed page request
+var REFRESH_EVERY = 50;  // XL: with 10,000 addresses, redraw the table every 50 (SELECT is heavy)
 var PAGE_SIZE = 50;      // UI rows per page
 var MERGE_CHUNK = 25;    // rows per batched MERGE
 var NET_TIMEOUT = 30000; // ms per net.GET
 var ARCHIVE_CUTOFF = 1000000;
 var SEARCH_DEBOUNCE = 300;    // ms — wait after typing before running the (full-table) SQL search
 var MIGRATE_BATCH = 200;      // rows per txdate backfill statement (one-time, for pre-0.1.9 installs)
-var ADDR_MAX_TXNS = 20000;    // per-address scan cap — beyond this, scan only the newest N (protects vs huge contracts)
+var LARGE_ADDR_WARN = 5000;   // XL: NO scan cap — above this many txns just warn that the address will take a while
 var LOCAL_HISTORY_MAX = 200;  // newest local txns read per resync (MDS history relevant:true) — covers normal deltas; gap-fallback handles more
 var DEFAULT_WALLET_SCRIPT_RE = /^\s*RETURN\s+SIGNEDBY\s*\(\s*0x[0-9a-fA-F]+\s*\)\s*$/i;
 
@@ -76,6 +81,14 @@ function trpc(proc,payload){
     if(b && b.error) throw new Error(b.error.json?b.error.json.message:"trpc error");
     if(b && b.result && b.result.data) return b.result.data.json;
     throw new Error("unexpected trpc shape");
+  });
+}
+/* XL: one automatic retry — across ~10,000 requests transient failures are certain, and a
+   dropped request must not mean a silently missing key in the history */
+function trpcRetry(proc,payload){
+  return trpc(proc,payload).catch(function(e){
+    if(state.cancel) throw e;
+    return delay(RETRY_DELAY).then(function(){ return trpc(proc,payload); });
   });
 }
 
@@ -163,8 +176,15 @@ function enumerateAddresses(){
     state.addrSet=set; state.addrList=list;
     return sql("DELETE FROM myaddr").then(function(){
       if(!list.length) return;
-      var vals=list.map(function(a){ return "("+S(a.address)+","+S(a.miniaddress)+")"; }).join(",");
-      return sql("INSERT INTO myaddr (address,miniaddress) VALUES "+vals);
+      // XL: chunked — one INSERT with 10,000 tuples is a multi-MB statement
+      var c=Promise.resolve();
+      for(var i=0;i<list.length;i+=500){
+        (function(slice){ c=c.then(function(){
+          var vals=slice.map(function(a){ return "("+S(a.address)+","+S(a.miniaddress)+")"; }).join(",");
+          return sql("INSERT INTO myaddr (address,miniaddress) VALUES "+vals);
+        }); })(list.slice(i,i+500));
+      }
+      return c;
     });
   });
 }
@@ -215,6 +235,18 @@ function classify(doc){
 /* Reconstruction stores SUMMARY rows only. The per-row expand view fetches inputs/outputs on demand. */
 var MERGE_HEAD_SUM ="MERGE INTO txns (txpowid,block,txtime,txdate,direction,in_amount,out_amount,net,tokenids,counterparties,summary_json,source) KEY(txpowid) VALUES ";
 function delay(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+/* XL: run worker(item) over items with a fixed number of parallel lanes; each lane pulls the
+   next item as it finishes. Resolves when every item is done (or state.cancel stops the pull). */
+function runPool(items, worker, lanes){
+  var idx=0;
+  function lane(){
+    if(state.cancel || idx>=items.length) return Promise.resolve();
+    var item=items[idx++];
+    return Promise.resolve(worker(item)).then(lane);
+  }
+  var runners=[]; for(var i=0;i<Math.max(1,N(lanes)||1);i++) runners.push(lane());
+  return Promise.all(runners);
+}
 /* compact body for the detail cache — inputs/outputs/state only */
 function compactDoc(doc){
   var t=(doc.body||{}).txn||{};
@@ -287,22 +319,25 @@ function reconstruct(opts){
     chain=chain.then(function(){ return sql("DELETE FROM txns WHERE source='explorer'"); })
       .then(function(){ logp("Cleared previous explorer rows for a clean rebuild."); return refresh(); });
   }
-  list.forEach(function(a){
-    var addr=a.miniaddress||a.address, type=a.type||"";
-    chain=chain.then(function(){
-      if(state.cancel) return;
+  /* XL: scan XL_WORKERS addresses in parallel — with 10,000 mostly-empty keys the wall clock
+     is dominated by request round-trips, and a couple of lanes roughly halves it while staying
+     polite to the explorer. MERGEs stay safe: txpowid is the PK, MDS serialises SQL. */
+  chain=chain.then(function(){
+    return runPool(list, function(a){
+      if(state.cancel) return Promise.resolve();
+      var addr=a.miniaddress||a.address, type=a.type||"";
       logp("▶ ["+(done+1)+"/"+total+"] "+type+"  "+addr);     // FULL address visible
-      var seen0=found;
+      var mine=0;
       return scanAddress(addr, since,
-          function(b){ found++; if(b>maxBlock) maxBlock=b; },
-          function(pg,tp){ if(tp>1) setProg((done+pg/tp)/total*100); })
-        .then(function(){ var n=found-seen0; if(n) logp("    +"+n+" tx"); })
-        .catch(function(e){ logp("  ! "+shortAddr(addr)+": "+e.message); });
-    }).then(function(){
-      done++; setProg(done/total*100);
-      var r = (done % REFRESH_EVERY===0) ? refresh() : Promise.resolve();  // refresh table infrequently (heavy on mobile)
-      return r.then(function(){ return delay(ADDR_THROTTLE); });
-    });
+          function(b){ found++; mine++; if(b>maxBlock) maxBlock=b; }, null)
+        .then(function(fnd){ if(mine) logp("    +"+mine+" tx  "+shortAddr(addr)); return fnd; })
+        .catch(function(e){ logp("  ! "+shortAddr(addr)+": "+e.message); return 0; })
+        .then(function(fnd){
+          done++; setProg(done/total*100);
+          var r = (done % REFRESH_EVERY===0) ? refresh() : Promise.resolve();  // refresh table infrequently
+          return r.then(function(){ return delay(N(fnd)>0?ADDR_THROTTLE:ADDR_THROTTLE_EMPTY); });
+        });
+    }, XL_WORKERS);
   });
 
   return chain.then(function(){
@@ -317,15 +352,15 @@ function reconstruct(opts){
     .then(function(){ endRun(); return refresh(); });
 }
 function scanAddress(addr, since, onSeen, onPage){
-  var page=1, totalPages=1;
+  var page=1, totalPages=1, found=0;
   function nextPage(){
     if(state.cancel) return Promise.resolve();
-    return trpc("search.get",{query:addr,filter:"all",page:page,perPage:PER_PAGE}).then(function(r){
+    return trpcRetry("search.get",{query:addr,filter:"all",page:page,perPage:PER_PAGE}).then(function(r){
       var hits=r.hits||[];
       if(page===1){
-        totalPages=Math.max(1,Math.ceil((r.found||0)/PER_PAGE));
-        var maxPages=Math.ceil(ADDR_MAX_TXNS/PER_PAGE);
-        if(totalPages>maxPages){ logp("    capped: "+(r.found||0)+" txns — scanning newest "+ADDR_MAX_TXNS); totalPages=maxPages; }
+        found=N(r.found);
+        totalPages=Math.max(1,Math.ceil(found/PER_PAGE));   // XL: NO cap — the full history is scanned
+        if(found>=LARGE_ADDR_WARN) logp("    large address: "+found.toLocaleString()+" txns ("+totalPages.toLocaleString()+" pages) — scanning ALL of it");
       }
       var tuples=[], stop=false;
       hits.forEach(function(h){
@@ -342,7 +377,7 @@ function scanAddress(addr, since, onSeen, onPage){
       });
     });
   }
-  return nextPage();
+  return nextPage().then(function(){ return found; });   // XL: callers use found for the empty fast path
 }
 
 /* ---------- signature-key analysis (ported from MinimaTransactionMonitor.java) ----------
@@ -415,12 +450,11 @@ function scanAddressSignatures(addr){
   var page=1, totalPages=1, map={};
   function nextPage(){
     if(state.cancel) return Promise.resolve();
-    return trpc("search.get",{query:addr,filter:"all",page:page,perPage:PER_PAGE}).then(function(r){
+    return trpcRetry("search.get",{query:addr,filter:"all",page:page,perPage:PER_PAGE}).then(function(r){
       var hits=r.hits||[];
       if(page===1){
-        totalPages=Math.max(1,Math.ceil((r.found||0)/PER_PAGE));
-        var maxPages=Math.ceil(ADDR_MAX_TXNS/PER_PAGE);
-        if(totalPages>maxPages){ logp("    capped: "+(r.found||0)+" txns — scanning newest "+ADDR_MAX_TXNS); totalPages=maxPages; }
+        totalPages=Math.max(1,Math.ceil((r.found||0)/PER_PAGE));   // XL: NO cap
+        if(N(r.found)>=LARGE_ADDR_WARN) logp("    large address: "+N(r.found).toLocaleString()+" txns — scanning ALL of it");
       }
       hits.forEach(function(h){ var doc=h.document; if(doc) tallyDoc(doc, addr, map); });
       if(state.cancel) return;

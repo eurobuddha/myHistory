@@ -1,4 +1,4 @@
-/* myHistory v0.2.6 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory v0.2.7 — reconstruct & maintain a node's transaction history (summary).
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
    Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
@@ -6,7 +6,7 @@
 (function(){
 "use strict";
 
-var VERSION   = "0.2.6";   // displayed version — keep in sync via the 4-spot build checklist
+var VERSION   = "0.2.7";   // displayed version — keep in sync via the 4-spot build checklist
 var EXPLORER  = "https://block.minima.global";        // tRPC API host (search.get, address.balance)
 var EXPLORER_WEB = "https://explorer.minima.global";  // human-facing explorer — tx page is /transactions/<txid>
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
@@ -199,14 +199,16 @@ function classify(doc){
     recs=amts.map(function(v,i){ return {a:oa[i], m:oma[i], amt:N(v)}; });
   }
   var mineIn=inA.some(isMine);
-  var mineOut=(doc.output_addresses||[]).concat(doc.output_mini_addresses||[]).some(isMine)
-           || recs.some(function(r){ return isMine(r.a)||isMine(r.m); });
   var toMine=0,toOthers=0,cps=[];
   recs.forEach(function(r){
     if(isMine(r.a)||isMine(r.m)){ toMine+=r.amt; }
     else { toOthers+=r.amt; var cp=r.m||r.a; if(cp&&cps.indexOf(cp)<0) cps.push(cp); }
   });
-  var dir=mineIn&&mineOut?"self":mineIn?"out":"in";
+  // Direction follows whether value actually LEFT the wallet. Change returns to a fresh own
+  // address on every send, so "my inputs + any output mine" would label every ordinary send
+  // "self" — instead 'self' is reserved for txns where NOTHING went to others
+  // (splits, consolidations, moves between own addresses).
+  var dir=mineIn?(toOthers>0?"out":"self"):"in";
   var net=dir==="in"?toMine:-toOthers;
   if(dir==="in"&&!cps.length){ (doc.input_mini_addresses||doc.input_addresses||[]).forEach(function(a){ if(!isMine(a)&&cps.indexOf(a)<0) cps.push(a); }); }
   return { direction:dir, in_amount:String(toMine), out_amount:String(toOthers), net:String(net),
@@ -308,7 +310,7 @@ function reconstruct(opts){
   return chain.then(function(){
     if(maxBlock) return metaGet("last_block").then(function(lb){ return metaSet("last_block", String(Math.max(N(lb),maxBlock))); });
   }).then(function(){ return metaSet("reconstruct_done","1"); })
-    .then(function(){ if(opts.clean && !state.cancel) return metaSet("scope_ver","2").then(function(){ return metaSet("amt_ver","1"); }); })   // default-wallet-only + per-coin-amount rebuild done
+    .then(function(){ if(opts.clean && !state.cancel) return metaSet("scope_ver","2").then(function(){ return metaSet("amt_ver","1"); }).then(function(){ return metaSet("dir_ver","1"); }); })   // default-wallet-only + per-coin-amount + direction-label rebuild done
     .then(function(){ if(maxBlock) return metaSet("tip_at_build",String(maxBlock)); })
     .then(function(){
       logp(state.cancel?("Stopped. "+found+" seen so far."):("Done. "+found+" transaction(s) processed."));
@@ -889,13 +891,15 @@ function init(){
     .then(createTables)
     .then(enumerateAddresses)
     .then(refresh)
-    .then(function(){ return Promise.all([metaGet("reconstruct_done"), metaGet("scope_ver"), metaGet("amt_ver")]); })
+    .then(function(){ return Promise.all([metaGet("reconstruct_done"), metaGet("scope_ver"), metaGet("amt_ver"), metaGet("dir_ver")]); })
     .then(function(m){
-      var done=m[0], scopeVer=m[1], amtVer=m[2];
+      var done=m[0], scopeVer=m[1], amtVer=m[2], dirVer=m[3];
       if(done==="1" && scopeVer!=="2")   // upgraded to default-wallet-only scope; old DB may hold tracked-contract rows
         showStatus("Updated to default-wallet only. Click Reconstruct now to remove tracked-contract transactions that aren't yours.","");
       else if(done==="1" && amtVer!=="1")   // pre-0.2.6 rows undercount multi-coin (split) amounts
         showStatus("This update fixes amounts for multi-coin transactions. Click Reconstruct now to recalculate your history.","");
+      else if(done==="1" && dirVer!=="1")   // pre-0.2.7 rows label sends-with-change as 'self'
+        showStatus("This update corrects sent-vs-self labels. Click Reconstruct now to relabel your history.","");
       else if(done==="1") showStatus("History loaded. New transactions are added automatically.","ok");
       else showStatus("No history yet — click Reconstruct now to rebuild from block.minima.global.","");
       migrateTxdate().then(function(){ if(state.filters.q) render(); });  // backfill old rows' search dates in the background

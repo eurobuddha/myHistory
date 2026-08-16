@@ -1,0 +1,24 @@
+#!/bin/sh
+# Guardrail (MiniDapp) — every code change ships with a dapp.conf version bump.
+# Blocks a commit touching web-app source (js/html/css/ts/svg) unless some
+# dapp.conf "version" changed vs HEAD. Real funds, real chain. No --no-verify.
+staged=$(git diff --cached --name-only); [ -z "$staged" ] && exit 0
+code=$(printf '%s\n' "$staged" | grep -iE '\.(js|mjs|ts|tsx|jsx|html|htm|css|svg)$' | grep -vE '(^|/)(node_modules|dist|build)/' | grep -viE 'package-lock\.json|(^|/)mds\.js$')
+[ -z "$code" ] && exit 0
+confs=$(git ls-files '*dapp.conf' 'dapp.conf' 2>/dev/null | sort -u)
+changed=0
+for c in $confs; do
+  hv=$(git show "HEAD:$c" 2>/dev/null | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1)
+  sv=$(git show ":$c" 2>/dev/null | grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1)
+  [ -z "$sv" ] && sv=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$c" 2>/dev/null | head -1)
+  if [ -n "$hv" ] && [ "$hv" != "$sv" ]; then changed=1; break; fi
+  if [ -z "$hv" ] && [ -n "$sv" ]; then changed=1; break; fi
+done
+if [ "$changed" -eq 0 ]; then
+  echo "──────────────────────────────────────────────────────────────────"
+  echo "  COMMIT BLOCKED — MiniDapp source changed but no dapp.conf \"version\" bumped."
+  echo "  Rule: every code change ships with a version bump (real funds, real chain)."
+  echo "  Fix: bump \"version\" in dapp.conf, stage it, then commit again."
+  echo "──────────────────────────────────────────────────────────────────"; exit 1
+fi
+exit 0

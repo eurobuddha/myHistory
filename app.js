@@ -27,7 +27,7 @@ var LOCAL_HISTORY_MAX = 200;  // newest local txns read per resync (MDS history 
 var DEFAULT_WALLET_SCRIPT_RE = /^\s*RETURN\s+SIGNEDBY\s*\(\s*0x[0-9a-fA-F]+\s*\)\s*$/i;
 
 var state = {
-  addrSet:new Set(), addrList:[], page:1, totalRows:0, matchCount:0, openTxid:null,
+  addrSet:new Set(), contractSet:new Set(), addrList:[], page:1, totalRows:0, matchCount:0, openTxid:null,
   sortKey:"txtime", sortDir:-1, busy:false, cancel:false,
   filters:{ dir:{in:true,out:true,self:true}, src:{explorer:true,archive:true}, tok:"", q:"" }
 };
@@ -148,19 +148,25 @@ function metaSet(k,v){ return sql("MERGE INTO meta (k,v) KEY(k) VALUES ("+S(k)+"
 function enumerateAddresses(){
   return mds("scripts").then(function(scripts){
     scripts=scripts||[];
-    var set=new Set(), list=[], seen=new Set();
+    var set=new Set(), contracts=new Set(), list=[], seen=new Set();
     scripts.forEach(function(s){
       if(!s || !(s.address||s.miniaddress)) return;
       // DEFAULT WALLET ONLY: tracked contract/newaddress scripts are SHARED (e.g. the FutureCash
       // maximize-stake address everyone's coins sit under) — including them pulls in other people's
       // transactions and mis-attributes them as yours. Skip anything that isn't a seed-derived key.
-      if(!DEFAULT_WALLET_SCRIPT_RE.test(s.script||"")) return;
+      if(!DEFAULT_WALLET_SCRIPT_RE.test(s.script||"")){
+        // Non-default script rows = CONTRACT addresses the node knows (casino, pools, order book).
+        // Kept in a separate set purely for LABELING — never for attribution.
+        if(s.address) contracts.add(String(s.address).toUpperCase());
+        if(s.miniaddress) contracts.add(String(s.miniaddress).toUpperCase());
+        return;
+      }
       if(s.address) set.add(String(s.address).toUpperCase());
       if(s.miniaddress) set.add(String(s.miniaddress).toUpperCase());
       var key=s.miniaddress||s.address;
       if(key && !seen.has(key)){ seen.add(key); list.push({address:s.address||"", miniaddress:s.miniaddress||s.address, type:"default"}); }
     });
-    state.addrSet=set; state.addrList=list;
+    state.addrSet=set; state.contractSet=contracts; state.addrList=list;
     return sql("DELETE FROM myaddr").then(function(){
       if(!list.length) return;
       var vals=list.map(function(a){ return "("+S(a.address)+","+S(a.miniaddress)+")"; }).join(",");
@@ -596,12 +602,28 @@ function wireCopy(container){
     setTimeout(function(){ b.textContent=o; b.classList.remove("ok"); },900);
   });
 }
+/* Ownership label for an address: YOURS (default wallet) / CONTRACT (a script the node knows,
+   e.g. the casino covenant) / EXTERNAL. Empty until the wallet set is known — no wrong labels. */
+function ownKind(a){
+  if(!state.addrSet.size) return "";
+  if(isMine(a)) return "YOURS";
+  if(a && state.contractSet.has(String(a).toUpperCase())) return "CONTRACT";
+  return "EXTERNAL";
+}
+function ownBadge(a){
+  var k=ownKind(a);
+  if(!k) return "";
+  var col=k==="YOURS"?"var(--in)":k==="CONTRACT"?"var(--out)":"var(--self)";
+  return '<span style="font-size:10px;font-weight:700;color:'+col+';border:1px solid '+col+
+         ';border-radius:3px;padding:0 4px;margin-left:6px;vertical-align:middle">'+k+'</span>';
+}
 function coinBlock(arr,label){
   if(!arr||!arr.length) return "";
   var h='<div class="blk"><h4>'+label+' ('+arr.length+')</h4>';
   arr.forEach(function(c){
+    var addr=c.miniaddress||c.address||"";
     h+='<div class="coin">';
-    h+=cfield("address", c.miniaddress||c.address||"");
+    h+=cfield("address", addr)+ownBadge(addr);
     if(c.amount!=null) h+=cfield("amount", c.amount);
     if(c.tokenid && c.tokenid!=="0x00") h+=cfield("token", c.tokenid);
     if(c.coinid) h+=cfield("coin", c.coinid);

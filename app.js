@@ -1,4 +1,9 @@
-/* myHistory v0.2.7 — reconstruct & maintain a node's transaction history (summary).
+/* myHistory Seed v0.2.8-seed — PERSONAL build. Paste a seed phrase; the dapp derives its classic
+   (64-leaf) addresses 0..N-1 — and optionally the block-as-keyuses (128-leaf) ones too — ON-DEVICE
+   (derive.js, byte-exact port from KeyUses Phrase, golden-tested), then reconstructs history for
+   those addresses from the explorer. The phrase and base seed are NEVER stored, logged or sent to
+   the node; only the derived PUBLIC addresses are kept (myaddr table). Not for the store.
+   Derived from myHistory 0.2.8.
    Data: block.minima.global tRPC (search.get). Storage: MDS H2 SQL. Vanilla JS.
    Reconstructs default-wallet + contract/script addresses. Row-expand shows inputs/outputs only.
    NOTE: on each release bump ALL of: dapp.conf version, VERSION below,
@@ -6,7 +11,7 @@
 (function(){
 "use strict";
 
-var VERSION   = "0.2.7";   // displayed version — keep in sync via the 4-spot build checklist
+var VERSION   = "0.2.8-seed";   // displayed version — keep in sync via the 4-spot build checklist
 var EXPLORER  = "https://block.minima.global";        // tRPC API host (search.get, address.balance)
 var EXPLORER_WEB = "https://explorer.minima.global";  // human-facing explorer — tx page is /transactions/<txid>
 var ARCHIVE_RPC = "http://127.0.0.1:16005";
@@ -23,7 +28,7 @@ var ARCHIVE_CUTOFF = 1000000;
 var SEARCH_DEBOUNCE = 300;    // ms — wait after typing before running the (full-table) SQL search
 var MIGRATE_BATCH = 200;      // rows per txdate backfill statement (one-time, for pre-0.1.9 installs)
 var ADDR_MAX_TXNS = 20000;    // per-address scan cap — beyond this, scan only the newest N (protects vs huge contracts)
-var LOCAL_HISTORY_MAX = 200;  // newest local txns read per resync (MDS history relevant:true) — covers normal deltas; gap-fallback handles more
+var SEED_DEFAULT_COUNT = 100;  // addresses per scheme derived from the pasted seed (indices 0..N-1)
 var DEFAULT_WALLET_SCRIPT_RE = /^\s*RETURN\s+SIGNEDBY\s*\(\s*0x[0-9a-fA-F]+\s*\)\s*$/i;
 
 var state = {
@@ -144,35 +149,100 @@ function migrateTxdate(){
 function metaGet(k){ return sql("SELECT v FROM meta WHERE k="+S(k)).then(function(r){ return r.length?r[0].V:null; }); }
 function metaSet(k,v){ return sql("MERGE INTO meta (k,v) KEY(k) VALUES ("+S(k)+","+S(v)+")"); }
 
-/* ---------- address enumeration (default wallet only) ---------- */
+/* ---------- address set: derived from the pasted seed (stored in myaddr) ---------- */
+function setAddrs(list){
+  var set=new Set();
+  list.forEach(function(a){ if(a.address) set.add(String(a.address).toUpperCase()); if(a.miniaddress) set.add(String(a.miniaddress).toUpperCase()); });
+  state.addrSet=set; state.addrList=list;
+}
 function enumerateAddresses(){
-  return mds("scripts").then(function(scripts){
-    scripts=scripts||[];
-    var set=new Set(), contracts=new Set(), list=[], seen=new Set();
-    scripts.forEach(function(s){
-      if(!s || !(s.address||s.miniaddress)) return;
-      // DEFAULT WALLET ONLY: tracked contract/newaddress scripts are SHARED (e.g. the FutureCash
-      // maximize-stake address everyone's coins sit under) — including them pulls in other people's
-      // transactions and mis-attributes them as yours. Skip anything that isn't a seed-derived key.
-      if(!DEFAULT_WALLET_SCRIPT_RE.test(s.script||"")){
-        // Non-default script rows = CONTRACT addresses the node knows (casino, pools, order book).
-        // Kept in a separate set purely for LABELING — never for attribution.
-        if(s.address) contracts.add(String(s.address).toUpperCase());
-        if(s.miniaddress) contracts.add(String(s.miniaddress).toUpperCase());
-        return;
-      }
-      if(s.address) set.add(String(s.address).toUpperCase());
-      if(s.miniaddress) set.add(String(s.miniaddress).toUpperCase());
-      var key=s.miniaddress||s.address;
-      if(key && !seen.has(key)){ seen.add(key); list.push({address:s.address||"", miniaddress:s.miniaddress||s.address, type:"default"}); }
+  // Node scripts are used ONLY to label CONTRACT addresses in the detail view — never for attribution.
+  return mds("scripts").catch(function(){ return []; }).then(function(scripts){
+    var contracts=new Set();
+    (scripts||[]).forEach(function(s){
+      if(!s || DEFAULT_WALLET_SCRIPT_RE.test(s.script||"")) return;
+      if(s.address) contracts.add(String(s.address).toUpperCase());
+      if(s.miniaddress) contracts.add(String(s.miniaddress).toUpperCase());
     });
-    state.addrSet=set; state.contractSet=contracts; state.addrList=list;
-    return sql("DELETE FROM myaddr").then(function(){
-      if(!list.length) return;
-      var vals=list.map(function(a){ return "("+S(a.address)+","+S(a.miniaddress)+")"; }).join(",");
-      return sql("INSERT INTO myaddr (address,miniaddress) VALUES "+vals);
+    state.contractSet=contracts;
+    return sql("SELECT address, miniaddress FROM myaddr");
+  }).then(function(rows){
+    setAddrs(rows.map(function(r){ return {address:r.ADDRESS||"", miniaddress:r.MINIADDRESS||r.ADDRESS, type:"default"}; }));
+  });
+}
+
+/* Derive jobs [{index,keysPerLevel}] on a Web Worker pool (falls back to inline if workers are
+   blocked or fail to load). Resolves to [{address(0x), miniaddress(Mx), type}] in job order. */
+function deriveAll(seedHex, jobs, onProg){
+  return new Promise(function(res,rej){
+    var n=jobs.length, out=new Array(n), next=0, doneN=0, failed=false, inlineOn=false;
+    function finish(j,d){
+      if(failed) return;
+      if(!d.ok){ failed=true; return rej(new Error(d.error)); }
+      out[j]={address:d.address, miniaddress:d.miniaddress, type:"default", kpl:jobs[j].keysPerLevel, index:jobs[j].index};
+      doneN++; onProg(doneN,n); if(doneN===n) res(out);
+    }
+    function deriveInline(j){
+      try{ var a=KeyUsesDerive.deriveAddress(KeyUsesDerive._fromHex(seedHex), jobs[j].index, null, jobs[j].keysPerLevel);
+           finish(j,{ok:true,address:a.hex,miniaddress:a.mx}); }
+      catch(e){ finish(j,{ok:false,error:e.message}); }
+    }
+    function inlineLane(){ if(inlineOn) return; inlineOn=true;
+      (function step(){ if(failed||next>=n) return; deriveInline(next++); setTimeout(step,0); })(); }
+    var lanes=Math.max(1,Math.min((navigator.hardwareConcurrency||4),8,n)), workers=[];
+    try{ for(var w=0;w<lanes;w++) workers.push(new Worker("derive.worker.js")); }catch(e){ workers=[]; }
+    if(!workers.length) return inlineLane();
+    workers.forEach(function(wk){
+      function pump(){ if(next<n){ wk.cur=next++; wk.postMessage({baseSeedHex:seedHex,index:jobs[wk.cur].index,keysPerLevel:jobs[wk.cur].keysPerLevel}); } else wk.terminate(); }
+      wk.onmessage=function(ev){ finish(wk.cur,ev.data); pump(); };
+      wk.onerror=function(e){ if(e&&e.preventDefault) e.preventDefault(); wk.terminate(); if(wk.cur!=null) deriveInline(wk.cur); wk.cur=null; inlineLane(); };
+      pump();
     });
   });
+}
+
+/* Paste seed -> derive -> store PUBLIC addresses. The phrase is read once, cleared from the box,
+   and never leaves this function (no MDS.cmd, no log, no storage). A different address set wipes
+   the old history so a previous seed's transactions never mix in. */
+function deriveFromSeed(){
+  if(state.busy) return;
+  var box=document.getElementById("seedPhrase"), raw=box.value, anyphrase=document.getElementById("seedAny").checked;
+  var count=Math.floor(N(document.getElementById("seedCount").value))||SEED_DEFAULT_COUNT;
+  var withBak=document.getElementById("seedBak").checked;
+  if(count<1||count>1000){ showStatus("Number of keys must be 1–1000.","error"); return; }
+  if(!raw.trim()){ showStatus("Paste your seed phrase first.","error"); return; }
+  var seedHex;
+  try{ seedHex=KeyUsesDerive._toHexUpper(KeyUsesDerive.seedFromPhrase(raw, anyphrase)); }
+  catch(e){ showStatus(e.message+(anyphrase?"":" (custom passphrase? tick “anyphrase”)"),"error"); return; }
+  box.value=""; raw=null;
+  var jobs=[], i;
+  for(i=0;i<count;i++) jobs.push({index:i,keysPerLevel:64});
+  if(withBak) for(i=0;i<count;i++) jobs.push({index:i,keysPerLevel:128});
+  setBusy(true); state.cancel=false; clearStatus(); showProg(true);
+  logp("Deriving "+count+" classic"+(withBak?(" + "+count+" block-as-keyuses"):"")+" address(es) on-device…");
+  var t0=Date.now();
+  return deriveAll(seedHex, jobs, function(d,n){ setProg(d/n*100); if(d%10===0||d===n) logp("  derived "+d+"/"+n); })
+    .then(function(list){
+      seedHex=null;
+      list.forEach(function(a){ logp("  "+(a.kpl===128?"bak":"classic")+" #"+a.index+"  "+a.miniaddress); });
+      var same=list.length===state.addrList.length && list.every(function(a){ return state.addrSet.has(String(a.miniaddress).toUpperCase()); });
+      var wipe=same?Promise.resolve():
+        ["txns","sigkeys","addrbal","meta"].reduce(function(c,t){ return c.then(function(){ return sql("DELETE FROM "+t); }); }, Promise.resolve())
+          .then(function(){ logp("New address set — cleared the previous seed's history."); });
+      return wipe.then(function(){ return sql("DELETE FROM myaddr"); }).then(function(){
+        var c=Promise.resolve();
+        for(var k=0;k<list.length;k+=100){ (function(slice){ c=c.then(function(){
+          return sql("INSERT INTO myaddr (address,miniaddress) VALUES "+slice.map(function(a){ return "("+S(a.address)+","+S(a.miniaddress)+")"; }).join(","));
+        }); })(list.slice(k,k+100)); }
+        return c;
+      }).then(function(){
+        setAddrs(list);
+        logp("Done in "+Math.round((Date.now()-t0)/1000)+"s.");
+        showStatus("Derived "+list.length+" address(es)."+(same?" Same set as before — history kept.":" Click Reconstruct now to build their history."),"ok");
+      });
+    })
+    .catch(function(e){ showStatus("Derivation failed: "+e.message,"error"); logp("ERROR "+e.message); })
+    .then(function(){ endRun(); refresh(); renderSigs(); });
 }
 
 function addrsFor(scope){
@@ -233,24 +303,6 @@ function tupleForDoc(doc){
   return "("+S(doc.txpow_id)+","+N(doc.block_number)+","+N(doc.datetime)+","+S(fmtDate(N(doc.datetime)))+","+S(c.direction)+","+
     S(c.in_amount)+","+S(c.out_amount)+","+S(c.net)+","+S(c.tokenids)+","+S(c.counterparties)+",NULL,'explorer')";   // 12-col
 }
-/* Map a LOCAL node txpow (from `history relevant:true`) into the explorer-document
-   shape classify()/tupleForDoc() consume — so the incremental path reuses one code path. */
-function docFromLocalTxpow(tp){
-  var txn=(tp.body||{}).txn||{}, ins=txn.inputs||[], outs=txn.outputs||[];
-  var tids={}; outs.forEach(function(o){ if(o&&o.tokenid) tids[o.tokenid]=1; });
-  return {
-    txpow_id: tp.txpowid,
-    block_number: (tp.header||{}).block,
-    datetime: (tp.header||{}).timemilli,
-    input_addresses: ins.map(function(i){ return i.address; }),
-    input_mini_addresses: ins.map(function(i){ return i.miniaddress; }),
-    output_addresses: outs.map(function(o){ return o.address; }),
-    output_mini_addresses: outs.map(function(o){ return o.miniaddress; }),
-    output_amounts: outs.map(function(o){ return o.amount; }),
-    token_ids: Object.keys(tids),
-    body: { txn: { inputs: ins, outputs: outs } }   // per-coin outputs → classify()'s accurate path
-  };
-}
 function batchMerge(tuples){
   var c2=Promise.resolve();
   for(var i=0;i<tuples.length;i+=MERGE_CHUNK){
@@ -265,7 +317,7 @@ function setProg(p){ document.getElementById("progBar").style.width=Math.max(0,M
 function showProg(on){ document.getElementById("prog").classList.toggle("hidden",!on); if(on) setProg(0); }
 function setBusy(b){
   state.busy=b;
-  ["reconBtn","backfillBtn","resyncBtn","sigScanBtn"].forEach(function(id){ var el=document.getElementById(id); if(el) el.disabled=b; });
+  ["reconBtn","backfillBtn","resyncBtn","sigScanBtn","seedBtn"].forEach(function(id){ var el=document.getElementById(id); if(el) el.disabled=b; });
   document.getElementById("stopBtn").classList.toggle("hidden",!b);
 }
 function updateButtons(){
@@ -305,7 +357,7 @@ function reconstruct(opts){
           function(b){ found++; if(b>maxBlock) maxBlock=b; },
           function(pg,tp){ if(tp>1) setProg((done+pg/tp)/total*100); })
         .then(function(){ var n=found-seen0; if(n) logp("    +"+n+" tx"); })
-        .catch(function(e){ logp("  ! "+shortAddr(addr)+": "+e.message); });
+        .catch(function(e){ logp("  ! "+addr+": "+e.message); });
     }).then(function(){
       done++; setProg(done/total*100);
       var r = (done % REFRESH_EVERY===0) ? refresh() : Promise.resolve();  // refresh table infrequently (heavy on mobile)
@@ -465,7 +517,7 @@ function scanSignatures(){
         if(uses) logp("    uses "+uses+", reused keys "+reused+", max "+mx);
         return delay(SCAN_THROTTLE).then(function(){ return fetchAddrBalance(addr); })
           .then(function(bal){ if(bal!=null) logp("    balance "+bal); });
-      }).catch(function(e){ logp("  ! "+shortAddr(addr)+": "+e.message); });
+      }).catch(function(e){ logp("  ! "+addr+": "+e.message); });
     }).then(function(){
       done++; setProg(done/total*100);
       var r=(done%REFRESH_EVERY===0)?renderSigs():Promise.resolve();
@@ -497,8 +549,8 @@ function backfillArchive(){
         (coins.created||[]).forEach(function(e){ var t=archiveTuple(e,"in"); if(t){ tuples.push(t); added++; } });
         (coins.spent||[]).forEach(function(e){ var t=archiveTuple(e,"out"); if(t){ tuples.push(t); added++; } });
         return batchArchive(tuples);
-      }).catch(function(e){ logp("  skip "+shortAddr(mx)+": "+e.message); });
-    }).then(function(){ done++; setProg(done/total*100); logp("["+done+"/"+total+"] "+shortAddr(mx)); return refresh(); });
+      }).catch(function(e){ logp("  skip "+mx+": "+e.message); });
+    }).then(function(){ done++; setProg(done/total*100); logp("["+done+"/"+total+"] "+mx); return refresh(); });
   });
   return chain.then(function(){ return metaSet("archive_done","1"); })
     .then(function(){ showStatus(state.cancel?"Backfill stopped.":("Archive backfill complete — "+added+" pre-2024 coin rows."),"ok"); })
@@ -520,43 +572,11 @@ function batchArchive(tuples){
 }
 
 /* ---------- incremental ---------- */
-var incTimer=null;
-function scheduleIncremental(){ if(state.busy) return; clearTimeout(incTimer); incTimer=setTimeout(incremental,1500); }
-/* Resync recent — read NEW transactions from the LOCAL node (one MDS.cmd, zero explorer
-   round-trips). Falls back to the explorer reconstruct for a fresh install, an over-cap gap,
-   or any local error. */
+/* Resync recent — the node's local history belongs to the NODE's wallet, not the pasted seed,
+   so new transactions come from the explorer: rescan every derived address since last_block. */
 function incremental(){
   if(state.busy) return Promise.resolve();
-  return Promise.all([metaGet("last_block"), metaGet("reconstruct_done")]).then(function(m){
-    var lb=N(m[0]);
-    if(m[1]!=="1") return reconstruct({scope:"all", sinceBlock:lb});   // no baseline yet → full explorer rebuild
-    setBusy(true); state.cancel=false; clearStatus();
-    return mds("history relevant:true max:"+LOCAL_HISTORY_MAX).then(function(res){
-      var txpows=(res&&res.txpows)||[], tuples=[], maxBlock=0, minBlockSeen=Infinity;
-      txpows.forEach(function(tp){
-        var blk=N((tp.header||{}).block); if(blk<minBlockSeen) minBlockSeen=blk;
-        if(!tp.body || !tp.body.txn || blk<=lb) return;       // skip blocks & already-stored txns
-        var doc=docFromLocalTxpow(tp);
-        if(!docTouchesMine(doc)) return;                      // shared-contract coin the node tracks — not mine
-        tuples.push(tupleForDoc(doc));
-        if(blk>maxBlock) maxBlock=blk;
-      });
-      // local window capped before reaching last_block → may have missed older gap txns
-      if(txpows.length>=LOCAL_HISTORY_MAX && minBlockSeen>lb+1){
-        MDS.log("[myHistory] local window capped → escalating to explorer");
-        setBusy(false); return reconstruct({scope:"all", sinceBlock:lb});
-      }
-      return (tuples.length?batchMerge(tuples):Promise.resolve()).then(function(){
-        if(maxBlock>lb) return metaSet("last_block", String(maxBlock));
-      }).then(function(){
-        if(tuples.length){ MDS.log("[myHistory] +"+tuples.length+" new (local)"); showStatus("Added "+tuples.length+" new transaction(s).","ok"); }
-        setBusy(false); return refresh();
-      });
-    }).catch(function(e){
-      MDS.log("[myHistory] local resync failed ("+e.message+") → explorer");
-      setBusy(false); return reconstruct({scope:"all", sinceBlock:lb});
-    });
-  });
+  return metaGet("last_block").then(function(lb){ return reconstruct({scope:"all", sinceBlock:N(lb)}); });
 }
 
 /* ---------- lazy detail: inputs/outputs (from search.get by txid) ---------- */
@@ -648,8 +668,7 @@ function renderDetail(container, d){
 /* ---------- rendering ---------- */
 function fmtDate(ms){ if(!ms) return "—"; return new Date(N(ms)).toISOString().slice(0,19).replace("T"," "); }
 function fmtAmt(v){ var n=Number(v); return isFinite(n)?n.toLocaleString(undefined,{maximumFractionDigits:8}):(v||"0"); }
-function tokName(t){ if(!t) return "—"; var f=String(t).split(",")[0]; return f==="0x00"?"Minima":(f.slice(0,10)+"…"); }
-function shortAddr(a){ a=String(a||""); return a.length>16?(a.slice(0,8)+"…"+a.slice(-4)):a; }
+function tokName(t){ if(!t) return "—"; var f=String(t).split(",")[0]; return f==="0x00"?"Minima":f; }   // full token id — never truncated
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
 
 /* Build a SQL WHERE clause from the active filters. Everything is pushed to the DB so we never
@@ -691,7 +710,7 @@ function render(){
           '<td data-label="Date" class="mono">'+esc(r.TXDATE||fmtDate(r.TXTIME))+'</td>'+
           '<td data-label="Dir"><span class="pill '+dc+'">'+dc+'</span></td>'+
           '<td data-label="Amount" class="amt '+ac+'">'+(net>0?"+":"")+fmtAmt(r.NET)+'</td>'+
-          '<td data-label="Token">'+esc(tokName(r.TOKENIDS))+'</td>'+
+          '<td data-label="Token" style="word-break:break-all">'+esc(tokName(r.TOKENIDS))+'</td>'+
           '<td data-label="Counterparty"><span class="trunc mono" title="'+esc(r.COUNTERPARTIES)+'">'+esc(r.COUNTERPARTIES||"—")+'</span></td>'+
           '<td data-label="Block" class="mono">'+(r.BLOCK||"—")+'</td>'+
           '<td data-label="TxID"><span class="trunc mono" title="'+esc(r.TXPOWID)+'">'+esc(r.TXPOWID)+'</span><span class="src">'+esc(r.SOURCE||"")+'</span></td>';
@@ -891,6 +910,7 @@ function init(){
   document.getElementById("reconBtn").onclick=function(){ reconstruct({scope:"default", clean:true}); };
   document.getElementById("backfillBtn").onclick=function(){ backfillArchive(); };
   document.getElementById("resyncBtn").onclick=function(){ incremental(); };
+  document.getElementById("seedBtn").onclick=function(){ deriveFromSeed(); };
   document.getElementById("sigScanBtn").onclick=function(){ scanSignatures(); };
   document.getElementById("stopBtn").onclick=function(){ state.cancel=true; logp("Stopping…"); };
   document.getElementById("exportCsvBtn").onclick=function(){ doExport("csv"); };
@@ -922,7 +942,8 @@ function init(){
         showStatus("This update fixes amounts for multi-coin transactions. Click Reconstruct now to recalculate your history.","");
       else if(done==="1" && dirVer!=="1")   // pre-0.2.7 rows label sends-with-change as 'self'
         showStatus("This update corrects sent-vs-self labels. Click Reconstruct now to relabel your history.","");
-      else if(done==="1") showStatus("History loaded. New transactions are added automatically.","ok");
+      else if(!state.addrList.length) showStatus("Paste a seed phrase and click Derive addresses to begin.","");
+      else if(done==="1") showStatus("History loaded for "+state.addrList.length+" derived address(es). Click Resync recent for new transactions.","ok");
       else showStatus("No history yet — click Reconstruct now to rebuild from block.minima.global.","");
       migrateTxdate().then(function(){ if(state.filters.q) render(); });  // backfill old rows' search dates in the background
     })
@@ -930,8 +951,7 @@ function init(){
 }
 
 MDS.init(function(msg){
-  if(msg.event==="inited"){ MDS.log("myHistory v"+VERSION+" ready"); init(); }
-  else if(msg.event==="NEWBALANCE"){ scheduleIncremental(); }
+  if(msg.event==="inited"){ MDS.log("myHistory Seed v"+VERSION+" ready"); init(); }
 });
 
 })();

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <meta http-equiv="Cache-Control" content="no-store"/>
 <meta http-equiv="Pragma" content="no-cache"/>
-<title>myHistory</title>
+<title>myHistory Seed</title>
 <style>
   :root{
     --bg:#0e1116; --panel:#161b22; --panel2:#1b222c; --line:#283040;
@@ -126,11 +126,30 @@
 
 <div class="wrap">
 
+  <div class="card" id="seedCard">
+    <h2>Seed phrase</h2>
+    <p>Paste a seed phrase. Its addresses are derived <b>on this device</b> — the phrase is never stored,
+       logged or sent to the node, and the box is cleared as soon as you click Derive. Only the derived
+       public addresses are kept.</p>
+    <textarea id="seedPhrase" rows="3" placeholder="word one two three …  (24 or 12 BIP39 words)" autocapitalize="off" autocomplete="off" spellcheck="false"
+      style="width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:10px 12px;font:inherit"></textarea>
+    <div class="row" style="margin-top:10px;align-items:center">
+      <label class="chk">Keys (0 … N-1) <input type="number" id="seedCount" value="100" min="1" max="1000"
+        style="width:90px;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:8px 10px"></label>
+      <label class="chk"><input type="checkbox" id="seedBak"> Also derive block-as-keyuses keys (same 0 … N-1)</label>
+      <label class="chk"><input type="checkbox" id="seedAny"> anyphrase (not BIP39 words)</label>
+      <button id="seedBtn">Derive addresses</button>
+    </div>
+    <div class="legend"><b>Classic</b> = 64-leaf trees (every node until minimaCore <code>-blockaskeyuses</code>).
+      <b>Block-as-keyuses</b> = 128-leaf trees — same seed, different addresses. Deriving a different set clears the
+      previous history. Classic ≈ 1 s/key, block-as-keyuses ≈ 2 s/key per CPU core.</div>
+  </div>
+
   <div class="card cta" id="ctaCard">
     <h2>Reconstruct your transaction history</h2>
-    <p>Reads your node's default wallet addresses, then rebuilds their full history
-       from <code>block.minima.global</code> (≈ Sept 2024 → now). After the first run, new transactions
-       are added automatically. Older history can be backfilled from an archive node.</p>
+    <p>Takes the addresses derived from your seed above, then rebuilds their full history
+       from <code>block.minima.global</code> (≈ Sept 2024 → now). Use Resync recent to pick up new transactions;
+       older history can be backfilled from an archive node.</p>
     <div class="row">
       <button id="reconBtn">Reconstruct now</button>
       <button class="ghost" id="resyncBtn">Resync recent</button>
@@ -143,7 +162,7 @@
       <div class="plog" id="progLog"></div>
     </div>
     <div id="statusBox" class="status"></div>
-    <div class="legend"><b>Reconstruct now</b> rebuilds your <b>default wallet</b> history from block.minima.global (shared contract/script addresses are excluded — their activity isn't yours). <b>Resync recent</b> adds new transactions from your node. New transactions are also added automatically. Expanding a row shows inputs/outputs.
+    <div class="legend"><b>Reconstruct now</b> rebuilds the history of every derived address from block.minima.global. <b>Resync recent</b> rescans them for new transactions since the last sync (not automatic — the seed isn't this node's wallet). Expanding a row shows inputs/outputs.
       <span class="src">explorer</span> · <span class="src">archive</span> coin-level only.</div>
   </div>
 
@@ -215,6 +234,9 @@
 </div>
 
 <script type="text/javascript" src="mds.js"></script>
-<script src="app.js?v=0.2.7"></script>
+<script src="sha3.js"></script>
+<script src="wordlist.js"></script>
+<script src="derive.js"></script>
+<script src="app.js?v=0.2.8-seed"></script>
 </body>
 </html>
